@@ -1,0 +1,4 @@
+name = "onnx-ocr"
+version = "0.1.0"
+description = "Indra OCR provider for Mesh LLM document routes"
+command = "mesh-onnx-ocr"

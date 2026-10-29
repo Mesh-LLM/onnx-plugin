@@ -1,0 +1,23 @@
+[package]
+name = "mesh-onnx-ocr"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Indra ONNX OCR provider plugin for Mesh LLM"
+repository = "https://github.com/Mesh-LLM/onnx"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["multipart", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", branch = "main" }
+ort = "=2.0.0-rc.12"
+unicode-normalization = "0.1"
+
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7763", "image_025", "thread_safe"] }
+reqwest = { version = "0.12", features = ["multipart", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+unicode-width = "0.2"
