@@ -104,15 +104,22 @@ Text-mode PDF extraction intentionally bypasses engine residency.
 
 ## Recorded state and remaining limits
 
-The macOS arm64 real-weight library suite passes 74 tests with no ignored tests.
+The macOS arm64 real-weight library suite passes 77 tests with no ignored tests.
 All four live cases pass, including host-owned asset prefetch, fresh offline loading, and FP32 and INT8 through
-two Mesh nodes, against a host built from `559c06e3b08ea1fee6b97909444cc079490217f3`.
+two Mesh nodes, against a host built from `1f248d5db443829865a4326fdf8a81b6750a94de`.
 The full-graph checks use `ort` 2.0.0-rc.12 and Rust 1.98.
 
-The native-hotloading contract was compared with #2704 at
-`f3c205e4e968e39dde89dc2f63345ff77862ad7c`. Both host changes were still open
-when this acceptance work began. Before landing, refresh the SDK pin to a Mesh
-main revision containing both #2710 and #2704 and rerun the paired checks.
+The matching host/SDK pin above is #2704's reconciliation with the merged
+#2710 (`50fb67dcd27a80941fb3b67abd0ff3254e3e8eb6`). The combined product build
+and real native GGUF cold-load/idle-unload/reload test also pass. Once #2704
+lands, refresh the SDK to its main landing commit and rerun the paired checks.
+
+Follow-up regressions check that Text mode never rasterizes, capped/rotated
+text geometry matches rendering, clipped image bounds do not duplicate an
+authoritative text layer even when OCR spelling differs, and recursive image
+traversal checks cancellation within a shared object budget. The live harness
+also tests startup port-error classification and bounded retries, waiting for
+its owned child's readiness event before publishing the selected URLs.
 
 This run certifies CPU behavior on macOS arm64 and two processes on one machine.
 It does not certify separate physical hosts, GPU providers or mathematical/OCR
@@ -121,5 +128,7 @@ model-backed OCR supplies layout labels. Mesh's chat-only `/v1/models` can remai
 empty on a node serving only these task endpoints.
 
 The prepared GitHub Actions workflow could not be pushed because the available
-OAuth token lacks `workflow` scope. Its absence is separate from the reproducible
-local acceptance tests checked into this PR.
+OAuth token lacks `workflow` scope. The reviewable template is
+[`ci/rust.yml.example`](../ci/rust.yml.example); publish it as
+`.github/workflows/rust.yml` using an authorized identity. Local acceptance
+tests are checked into this PR independently of workflow publication.

@@ -135,6 +135,42 @@ pub async fn infer(client: &reqwest::Client, base: &str, index: usize) -> Value 
     value
 }
 
+const MAX_START_ATTEMPTS: usize = 3;
+
+fn can_retry_startup(attempt: usize, logs: &str) -> bool {
+    attempt < MAX_START_ATTEMPTS
+        && logs.lines().any(|line| {
+            // Only an error carrying both the bind context and AddrInUse cause is
+            // a port race. Missing assets, rejected config, and timeouts must fail.
+            let message = match serde_json::from_str::<Value>(line) {
+                Ok(value) if value["level"] == "error" || value["level"] == "fatal" => {
+                    value["message"].as_str().map(|message| {
+                        format!(
+                            "{message}: {}",
+                            value["context"].as_str().unwrap_or_default()
+                        )
+                    })
+                }
+                Ok(_) => None,
+                Err(_) => line.strip_prefix("Error:").map(str::to_owned),
+            };
+            message.is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("bind")
+                    && (message.contains("address already in use")
+                        || message.contains("addrinuse")
+                        || message.contains("os error 48")
+                        || message.contains("os error 98")
+                        || message.contains("os error 10048"))
+            })
+        })
+}
+
+struct StartupFailure {
+    exited: bool,
+    detail: String,
+}
+
 pub struct Server {
     child: Child,
     pub root: tempfile::TempDir,
@@ -146,6 +182,31 @@ impl Server {
         Self::start_with_cache(models, join, None, false)
     }
     pub fn start_with_cache(
+        models: &str,
+        join: Option<&str>,
+        cache: Option<&std::path::Path>,
+        offline: bool,
+    ) -> Self {
+        let mut failures = Vec::new();
+        for attempt in 1..=MAX_START_ATTEMPTS {
+            let mut server = Self::spawn_once(models, join, cache, offline);
+            match server.wait_for_startup() {
+                Ok(()) => return server,
+                Err(failure) => {
+                    let logs = server.logs();
+                    failures.push(format!("attempt {attempt}: {}\n{logs}", failure.detail));
+                    let retry = failure.exited && can_retry_startup(attempt, &logs);
+                    // Reap this owned child before releasing its directory or
+                    // choosing fresh ports. Callers only see the final URLs.
+                    drop(server);
+                    assert!(retry, "Mesh startup failed:\n{}", failures.join("\n"));
+                }
+            }
+        }
+        unreachable!("the last failed attempt must report its diagnostics")
+    }
+
+    fn spawn_once(
         models: &str,
         join: Option<&str>,
         cache: Option<&std::path::Path>,
@@ -218,6 +279,35 @@ impl Server {
             control: format!("http://127.0.0.1:{control_port}"),
         }
     }
+    fn wait_for_startup(&mut self) -> Result<(), StartupFailure> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("check Mesh child status") {
+                return Err(StartupFailure {
+                    exited: true,
+                    detail: format!("Mesh exited {status}"),
+                });
+            }
+            // This event is emitted by our child after it has bound both the
+            // API and console listeners. Probing a port alone could accept a
+            // different process that won the reserve-close-spawn race.
+            let ready = self.logs().lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .is_ok_and(|value| value["event"] == "api_ready" && value["url"] == self.base)
+            });
+            if ready {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(StartupFailure {
+                    exited: false,
+                    detail: "Mesh startup deadline".into(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub fn logs(&self) -> String {
         std::fs::read_to_string(self.root.path().join("server.log")).unwrap_or_default()
     }
@@ -285,5 +375,32 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn retries_only_address_in_use_startup_failures_and_stops_at_the_bound() {
+        let collision = r#"{"level":"error","event":"error","message":"Failed to bind Web console to port 1234: Address already in use (os error 48)"}"#;
+        let fatal = r#"{"level":"fatal","event":"fatal","message":"Failed to bind Web console to port 1234","context":"Address already in use (os error 48)"}"#;
+        assert!(can_retry_startup(1, fatal));
+        assert!(can_retry_startup(1, collision));
+        assert!(can_retry_startup(MAX_START_ATTEMPTS - 1, collision));
+        assert!(!can_retry_startup(MAX_START_ATTEMPTS, collision));
+        assert!(can_retry_startup(
+            1,
+            "Error: Failed to bind API: Address already in use (os error 98)"
+        ));
+        for logs in [
+            r#"{"level":"error","message":"required model asset is missing"}"#,
+            r#"{"level":"error","message":"Failed to bind Web console: Permission denied (os error 13)"}"#,
+            r#"{"level":"warn","message":"Failed to bind: Address already in use"}"#,
+            "Error: invalid configuration",
+        ] {
+            assert!(!can_retry_startup(1, logs), "{logs}");
+        }
     }
 }

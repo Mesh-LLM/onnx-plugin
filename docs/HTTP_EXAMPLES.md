@@ -60,15 +60,27 @@ command = "/absolute/path/to/mesh-onnx"
 [[models]]
 model = "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b"
 provider = "onnx"
+[models.lifecycle]
+load = "on_demand"
+idle_timeout_secs = 300
+prefetch = true
 
 [[models]]
 model = "onnx-community/whisper-tiny@ff4177021cc41f7db950912b73ea4fdf7d01d8e7"
 provider = "onnx"
 variant = "int8"
+[models.lifecycle]
+load = "on_demand"
+idle_timeout_secs = 300
+prefetch = true
 
 [[models]]
 model = "Xenova/clip-vit-base-patch32@6b7c523703ae26e39be4b03774966f8571c7f523"
 provider = "onnx"
+[models.lifecycle]
+load = "on_demand"
+idle_timeout_secs = 300
+prefetch = true
 
 [[models]]
 model = "onnx-community/depth-anything-v2-small-ONNX@c3b67641fd837b2368757101311e5d21e511441e"

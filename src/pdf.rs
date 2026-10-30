@@ -18,6 +18,10 @@ use crate::ocr::{Document, Engine, Line, Page, document::*};
 const MAX_DIMENSION: i32 = 4096;
 const MAX_PAGES: usize = 1000;
 const MAX_IMAGE_REGIONS: usize = 256;
+const MAX_PAGE_OBJECTS: usize = 16_384;
+
+#[cfg(test)]
+thread_local! { static RASTERIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 static PDFIUM_BIND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Errors at the document boundary, distinct from model inference failures.
@@ -219,12 +223,14 @@ fn process_page(
     engine: &mut Option<&mut Engine>,
     cancel: &AtomicBool,
 ) -> Result<Page> {
-    let image = page
-        .render_with_config(config)
-        .context("render PDF page")?
-        .as_image()
-        .context("decode PDF page bitmap")?
-        .into_luma8();
+    // Text extraction needs the same coordinate space as OCR, without allocating
+    // or painting a bitmap. These dimensions match our DPI + maximum-size config.
+    let (width, height) = page_dimensions(page, options.dpi)?;
+    if options.mode == OcrMode::Text {
+        let lines = text_lines(page, config, width, height)?;
+        return page_from_text_lines(lines, index, width, height, options.keep_furniture);
+    }
+    let image = render_page(page, config)?;
     if options.mode == OcrMode::Ocr {
         return required_engine(engine)?.recognize_image_with_options(
             &image,
@@ -252,13 +258,22 @@ fn process_page(
     }
     let mut hybrid = false;
     if options.image_ocr && options.mode != OcrMode::Text {
-        let regions = image_regions(page, config, image.width(), image.height())?;
+        let regions = image_regions(page, config, image.width(), image.height(), cancel)?;
+        let text_layer_boxes = lines.iter().map(|line| line.bbox).collect::<Vec<_>>();
         if !regions.is_empty() {
             let engine = required_engine(engine)?;
             for region in regions {
                 check_cancelled(cancel)?;
                 let before = lines.len();
-                append_image_ocr(&image, region, &mut lines, engine, index, options)?;
+                append_image_ocr(
+                    &image,
+                    region,
+                    &text_layer_boxes,
+                    &mut lines,
+                    engine,
+                    index,
+                    options,
+                )?;
                 hybrid |= lines.len() > before;
             }
         }
@@ -280,6 +295,32 @@ fn process_page(
             options.keep_furniture,
         )
     }
+}
+
+fn page_dimensions(page: &PdfPage<'_>, dpi: u32) -> Result<(u32, u32)> {
+    let width = page.width().value;
+    let height = page.height().value;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        bail!("PDF page has invalid dimensions");
+    }
+    let scale = (dpi as f32 / 72.0)
+        .min(MAX_DIMENSION as f32 / width)
+        .min(MAX_DIMENSION as f32 / height);
+    Ok((
+        (width * scale).round().max(1.0) as u32,
+        (height * scale).round().max(1.0) as u32,
+    ))
+}
+
+fn render_page(page: &PdfPage<'_>, config: &PdfRenderConfig) -> Result<GrayImage> {
+    #[cfg(test)]
+    RASTERIZATIONS.with(|count| count.set(count.get() + 1));
+    Ok(page
+        .render_with_config(config)
+        .context("render PDF page")?
+        .as_image()
+        .context("decode PDF page bitmap")?
+        .into_luma8())
 }
 
 fn text_lines(
@@ -371,11 +412,23 @@ fn group_text_segments(segments: Vec<Line>) -> Vec<Line> {
     lines
 }
 
+fn visit_page_object(cancel: &AtomicBool, visited: &mut usize) -> Result<()> {
+    check_cancelled(cancel)?;
+    if *visited >= MAX_PAGE_OBJECTS {
+        bail!("PDF page exceeds 16384 traversed objects");
+    }
+    *visited += 1;
+    Ok(())
+}
+
 fn collect_image_rects(
     object: &PdfPageObject<'_>,
     ancestors: &mut Vec<PdfMatrix>,
     rects: &mut Vec<PdfRect>,
+    cancel: &AtomicBool,
+    visited: &mut usize,
 ) -> Result<()> {
+    visit_page_object(cancel, visited)?;
     if object.as_image_object().is_some() {
         if rects.len() >= MAX_IMAGE_REGIONS {
             bail!("PDF page exceeds 256 image regions");
@@ -414,7 +467,7 @@ fn collect_image_rects(
         }
         ancestors.push(form.matrix()?);
         for index in form.as_range() {
-            collect_image_rects(&form.get(index)?, ancestors, rects)?;
+            collect_image_rects(&form.get(index)?, ancestors, rects, cancel, visited)?;
         }
         ancestors.pop();
     }
@@ -426,10 +479,13 @@ fn image_regions(
     config: &PdfRenderConfig,
     width: u32,
     height: u32,
+    cancel: &AtomicBool,
 ) -> Result<Vec<[f32; 4]>> {
+    check_cancelled(cancel)?;
+    let mut visited = 0;
     let mut rects = Vec::new();
     for object in page.objects().iter() {
-        collect_image_rects(&object, &mut Vec::new(), &mut rects)?;
+        collect_image_rects(&object, &mut Vec::new(), &mut rects, cancel, &mut visited)?;
     }
     rects
         .into_iter()
@@ -459,6 +515,7 @@ fn insert_image_line(lines: &mut Vec<Line>, line: Line) {
 fn append_image_ocr(
     page: &GrayImage,
     region: [f32; 4],
+    text_layer_boxes: &[[f32; 4]],
     lines: &mut Vec<Line>,
     engine: &mut Engine,
     index: usize,
@@ -494,9 +551,15 @@ fn append_image_ocr(
         line.bbox[2] += x0 as f32;
         line.bbox[1] += y0 as f32;
         line.bbox[3] += y0 as f32;
-        if !lines
+        // The readable PDF layer owns text in its boxes. Rendered image bounds
+        // can include clipped-out areas and overlaid text, and OCR spelling may
+        // differ, so geometry (not string equality) decides this boundary.
+        if !text_layer_boxes
             .iter()
-            .any(|prior| prior.text.trim() == line.text.trim() && overlaps(prior.bbox, line.bbox))
+            .any(|bbox| overlaps(*bbox, line.bbox))
+            && !lines.iter().any(|prior| {
+                prior.text.trim() == line.text.trim() && overlaps(prior.bbox, line.bbox)
+            })
         {
             insert_image_line(lines, line);
         }
@@ -683,7 +746,13 @@ mod tests {
             image_ocr: false,
             ..PdfOptions::default()
         };
+        let before = RASTERIZATIONS.with(std::cell::Cell::get);
         let first = process(&text_pdf(), Some(Path::new(&library)), &options, None).unwrap();
+        assert_eq!(
+            RASTERIZATIONS.with(std::cell::Cell::get),
+            before,
+            "text mode must not rasterize the page"
+        );
         assert_eq!(first.pages.len(), 1);
         assert_eq!(first.pages[0].source, "text");
         assert!(first.pages[0].text.contains("without model weights"));
@@ -974,8 +1043,42 @@ mod tests {
         drop(lock);
         let document = pdfium.load_pdf_from_byte_vec(data, None).unwrap();
         let page = document.pages().get(0).unwrap();
-        let regions = image_regions(&page, &PdfRenderConfig::new(), 300, 300).unwrap();
+        let regions = image_regions(
+            &page,
+            &PdfRenderConfig::new(),
+            300,
+            300,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(regions.len(), 1);
+        assert!(
+            image_regions(
+                &page,
+                &PdfRenderConfig::new(),
+                300,
+                300,
+                &AtomicBool::new(true)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+        );
+        let object = page.objects().get(0).unwrap();
+        let mut visited = MAX_PAGE_OBJECTS - 1;
+        let error = collect_image_rects(
+            &object,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &AtomicBool::new(false),
+            &mut visited,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("traversed objects"));
+        assert_eq!(
+            visited, MAX_PAGE_OBJECTS,
+            "nested traversal must share the outer budget"
+        );
         for (actual, expected) in regions[0].iter().zip([80.0, 175.0, 120.0, 195.0]) {
             assert!(
                 (actual - expected).abs() <= 1.0,
@@ -983,5 +1086,145 @@ mod tests {
                 regions[0]
             );
         }
+    }
+    #[test]
+    fn object_traversal_checks_cancellation_and_bounds_visits_without_images() {
+        let cancel = AtomicBool::new(false);
+        let mut visited = 0;
+        for _ in 0..MAX_PAGE_OBJECTS {
+            visit_page_object(&cancel, &mut visited).unwrap();
+        }
+        assert!(
+            visit_page_object(&cancel, &mut visited)
+                .unwrap_err()
+                .to_string()
+                .contains("traversed objects")
+        );
+        assert_eq!(visited, MAX_PAGE_OBJECTS);
+        cancel.store(true, Ordering::Relaxed);
+        let mut visited = 0;
+        assert!(
+            visit_page_object(&cancel, &mut visited)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; compares text geometry dimensions against actual capped rendering"]
+    fn real_text_dimensions_match_rotated_and_capped_bitmaps_without_rendering() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let lock = PDFIUM_BIND_LOCK.lock().unwrap();
+        let pdfium = match Pdfium::bind_to_library(Path::new(&library)) {
+            Ok(bindings) => Pdfium::new(bindings),
+            Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Pdfium::default(),
+            Err(error) => panic!("load Pdfium: {error}"),
+        };
+        drop(lock);
+        let document = pdfium.load_pdf_from_byte_vec(text_pdf(), None).unwrap();
+        let mut page = document.pages().get(0).unwrap();
+        for rotation in [
+            PdfPageRenderRotation::None,
+            PdfPageRenderRotation::Degrees90,
+        ] {
+            page.set_rotation(rotation);
+            for dpi in [72, 144, 600] {
+                let config = PdfRenderConfig::new()
+                    .scale_page_by_factor(dpi as f32 / 72.0)
+                    .set_maximum_width(MAX_DIMENSION)
+                    .set_maximum_height(MAX_DIMENSION);
+                let dimensions = page_dimensions(&page, dpi).unwrap();
+                let bitmap = page.render_with_config(&config).unwrap();
+                assert_eq!(dimensions, (bitmap.width() as u32, bitmap.height() as u32));
+                let before = RASTERIZATIONS.with(std::cell::Cell::get);
+                let options = PdfOptions {
+                    dpi,
+                    mode: OcrMode::Text,
+                    ..PdfOptions::default()
+                };
+                let text = process_page(
+                    &page,
+                    0,
+                    &config,
+                    &options,
+                    &mut None,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(RASTERIZATIONS.with(std::cell::Cell::get), before);
+                assert!(text.text.contains("without model weights"));
+            }
+        }
+    }
+
+    // A white image is clipped to the bottom of the page, but its un-clipped
+    // object bounds encompass the PDF text above it. A ToUnicode mapping makes
+    // extracted spelling differ intentionally from the painted glyphs, proving
+    // that comparing OCR and text strings cannot prevent duplicate extraction.
+    fn clipped_image_over_text_pdf() -> Vec<u8> {
+        use std::fmt::Write;
+        let mut mapping = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /FixtureUnicode def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n95 beginbfchar\n".to_owned();
+        for character in 32..=126u8 {
+            let mapped = if character == b'R' { b'X' } else { character };
+            writeln!(mapping, "<{character:02X}> <{mapped:04X}>").unwrap();
+        }
+        mapping.push_str(
+            "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend",
+        );
+        pdf_objects(vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 400] /Resources << /XObject << /Im 6 0 R >> /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 7 0 R >>".to_vec(),
+            stream("", b"q 40 40 500 60 re W n 500 0 0 300 40 40 cm /Im Do Q BT /F1 18 Tf 50 250 Td (RENDERED WORDS FROM THE PDF TEXT LAYER) Tj ET"),
+            stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[255]),
+            stream("", mapping.as_bytes()),
+        ])
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY and ONNX_OCR_MODEL_DIR; verifies clipped image bounds cannot duplicate authoritative text"]
+    fn real_clipped_image_does_not_duplicate_differently_spelled_pdf_text() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let directory = std::env::var("ONNX_OCR_MODEL_DIR").expect("ONNX_OCR_MODEL_DIR");
+        let data = clipped_image_over_text_pdf();
+        let mut engine = Engine::load(Path::new(&directory)).unwrap();
+        let mut options = PdfOptions {
+            mode: OcrMode::Ocr,
+            ..PdfOptions::default()
+        };
+        let raster = process(
+            &data,
+            Some(Path::new(&library)),
+            &options,
+            Some(&mut engine),
+        )
+        .unwrap();
+        assert!(
+            raster.pages[0].text.contains("RENDERED WORDS"),
+            "{}",
+            raster.pages[0].text
+        );
+        options.mode = OcrMode::Auto;
+        let text = process(
+            &data,
+            Some(Path::new(&library)),
+            &options,
+            Some(&mut engine),
+        )
+        .unwrap();
+        assert!(
+            text.pages[0].text.contains("XENDEXED WOXDS"),
+            "{}",
+            text.pages[0].text
+        );
+        assert!(!text.pages[0].text.contains("RENDERED"));
+        assert_eq!(
+            text.pages[0].source, "text",
+            "overlapping OCR adds no content"
+        );
+        assert_eq!(text.pages[0].lines.len(), 1, "{:?}", text.pages[0].lines);
     }
 }
