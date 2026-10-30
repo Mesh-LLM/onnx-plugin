@@ -38,15 +38,15 @@ impl DepthMap {
             .iter()
             .copied()
             .fold(f32::NEG_INFINITY, f32::max);
-        let range = max - min;
+        let range = f64::from(max) - f64::from(min);
         let pixels = self
             .values
             .iter()
             .map(|value| {
-                if range <= f32::EPSILON {
+                if range == 0.0 {
                     0
                 } else {
-                    (((value - min) / range) * 255.0).round() as u8
+                    (((f64::from(*value) - f64::from(min)) / range) * 255.0).round() as u8
                 }
             })
             .collect();
@@ -299,6 +299,19 @@ mod tests {
             ..map
         };
         assert_eq!(constant.normalized_preview().unwrap().as_raw(), &[0, 0]);
+    }
+
+    #[test]
+    fn preview_normalizes_extreme_and_sub_epsilon_finite_ranges() {
+        for values in [vec![-f32::MAX, 0.0, f32::MAX], vec![0.0, 1e-20, 2e-20]] {
+            let map = DepthMap {
+                width: 3,
+                height: 1,
+                units: "relative",
+                values,
+            };
+            assert_eq!(map.normalized_preview().unwrap().as_raw(), &[0, 128, 255]);
+        }
     }
 
     #[test]

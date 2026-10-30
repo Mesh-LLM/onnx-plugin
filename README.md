@@ -18,7 +18,7 @@ name = "onnx"
 command = "/absolute/path/to/mesh-onnx"
 
 [[models]]
-model = "datalab-to/indra-ocr@v1.1.0"
+model = "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b"
 provider = "onnx"
 [models.options]
 threads = 4
@@ -33,7 +33,7 @@ Run `mesh-llm serve`, then invoke OCR through Mesh's inference listener:
 
 ```sh
 curl --fail-with-body -H 'Accept: application/json' \
-  -F 'model=datalab-to/indra-ocr@v1.1.0' -F 'file=@scan.png' \
+  -F 'model=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b' -F 'file=@scan.png' \
   http://localhost:9337/mesh/v1/documents/ocr
 ```
 
@@ -51,6 +51,10 @@ cargo clippy --offline --all-targets -- -D warnings
 
 This implementation requires the companion Mesh model-asset RPC and provider configuration support. Model weights remain outside the binary. The `ort` crate supplies ONNX Runtime; inspect native library dependencies when packaging. Pdfium is optional for images.
 
-Weights were unavailable during development, so the offline suite ran without them. Every pinned graph has since been downloaded at its recorded revision and exercised on real weights, FP32 and INT8 where the recipe offers both: 56 tests pass with `--include-ignored`, including per-model numerical pins rather than session-construction checks. See [validation](docs/TESTING.md) for what each weight test asserts and the one recorded single-node Mesh pass. Adapter limitations and response semantics are documented per model.
+The real-weight suite covers every supported precision, complete math decoding, and encrypted/hybrid PDFs. The in-repository live tests launch Mesh and the plugin to certify cold loading, concurrent requests, idle eviction, cached reload and peer routing. See [validation](docs/TESTING.md) for commands, exact model pins and recorded results. Adapter limitations and response semantics are documented per model.
 
 Indra code is Apache-2.0; its model weights use [modified OpenRAIL-M terms](https://huggingface.co/datalab-to/indra-ocr/blob/v1.1.0/LICENSE). Other model licenses and artifact provenance must be checked at their pinned source revisions before packaging or redistribution.
+
+## Migrating the OCR-only plugin
+
+The managed provider uses plugin name `onnx`, executable `mesh-onnx` and Pdfium variable `ONNX_PDFIUM_LIBRARY`. Update existing `onnx-ocr` / `mesh-onnx-ocr` configurations and `ONNX_OCR_PDFIUM_LIBRARY` when installing it. Model selections belong under `[[models]]` with `provider = "onnx"`; the Indra selection now pins the immutable commit shown above.

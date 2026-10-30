@@ -163,7 +163,10 @@ impl Whisper {
                 .languages
                 .contains_key(&format!("<|{language}|>"))
         {
-            bail!("language must be auto or a language code supported by this Whisper model");
+            return Err(super::InvalidRequest(
+                "language must be auto or a language code supported by this Whisper model",
+            )
+            .into());
         }
         Ok(())
     }
@@ -468,13 +471,23 @@ mod tests {
             // The fixture is spoken English and detection runs off the first
             // decoder step's logits, so this pins detection as well as decode.
             assert_eq!(first.language, "en", "{variable}");
-            let text = first.text.to_lowercase();
-            for phrase in ["quick brown fox", "lazy dog", "mesh"] {
-                assert!(
-                    text.contains(phrase),
-                    "{variable} transcript missing {phrase:?}: {text}"
-                );
-            }
+            assert_eq!(second.language, "en", "{variable}");
+            // Pin the complete known output, including Tiny's "routes" ->
+            // "roots" and "node" -> "note" mistakes. The fixture README records
+            // spoken text separately so this is a reproducibility assertion,
+            // not a claim of verbatim recognition quality.
+            let normalize = |text: &str| {
+                text.split(|ch: char| !ch.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            assert_eq!(
+                normalize(&first.text),
+                "the quick brown fox jumps over the lazy dog mesh roots speech recognition to whichever note is serving the model",
+                "{variable}: complete fixture transcript"
+            );
             assert!(first.generated_tokens > 4, "{variable}: no decoder steps");
             ran += 1;
         }

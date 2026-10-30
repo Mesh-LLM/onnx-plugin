@@ -58,7 +58,7 @@ name = "onnx"
 command = "/absolute/path/to/mesh-onnx"
 
 [[models]]
-model = "datalab-to/indra-ocr@v1.1.0"
+model = "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b"
 provider = "onnx"
 
 [[models]]
@@ -96,7 +96,7 @@ the root).
 ```sh
 curl --fail-with-body \
   -H 'Accept: application/json' \
-  -F 'model=datalab-to/indra-ocr@v1.1.0' \
+  -F 'model=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b' \
   -F 'file=@scan.pdf' \
   http://localhost:9337/mesh/v1/documents/ocr
 ```
@@ -115,7 +115,7 @@ Booleans and numbers are sent as JSON literals (`-F 'image_ocr=false'`,
 plugin host; images do not.
 
 ```json
-{"model":"datalab-to/indra-ocr@v1.1.0","pages":[{"page_index":0,"text":"Invoice 4471","markdown":"Invoice 4471","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Invoice 4471","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
+{"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","pages":[{"page_index":0,"text":"Invoice 4471","markdown":"Invoice 4471","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Invoice 4471","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
 ```
 
 `text/plain` and `text/markdown` return the concatenated page text, separated by
@@ -134,7 +134,7 @@ curl --fail-with-body \
 | Field | Values | Default |
 |---|---|---|
 | `language` | `auto` or a 2–3 letter lowercase code | `auto` |
-| `max_output_tokens` | 1–448 | 128 |
+| `max_output_tokens` | 1–444 | 128 |
 
 WAV, mono or stereo, PCM16 or float32, up to 30 seconds; it is resampled to
 16 kHz. Longer audio is rejected rather than truncated, because this provider
@@ -220,14 +220,14 @@ backend runs them through Mesh in one pipeline.
 
 ```sh
 BASE=http://localhost:9337
-OCR_MODEL=datalab-to/indra-ocr@v1.1.0
+OCR_MODEL=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b
 CLIP_MODEL=Xenova/clip-vit-base-patch32@6b7c523703ae26e39be4b03774966f8571c7f523
 DEPTH_MODEL=onnx-community/depth-anything-v2-small-ONNX@c3b67641fd837b2368757101311e5d21e511441e
 WHISPER_MODEL=onnx-community/whisper-tiny@ff4177021cc41f7db950912b73ea4fdf7d01d8e7
 ```
 
 **1. Read the form.** `mode=auto` uses the text layer when the PDF has one and
-falls back to recognizing pixels, so a born-digital form costs no OCR at all.
+falls back to recognizing pixels. With the default `image_ocr=true`, embedded images can still be recognized; use `image_ocr=false` to skip those regions or `mode=text` to extract only text without a model session.
 `source` in the response says which path was taken.
 
 ```sh
@@ -275,6 +275,5 @@ curl --fail-with-body -H 'Accept: application/json' \
 ```
 
 The claim record then holds the form text, the damage class, a documentation
-quality flag and the technician's own words — four local models, one port, no
-data leaving the node. Repeat submissions hit the cache and a resident model
+quality flag and the technician's own words — four models behind one port. Uploads travel to the serving node in a multi-node mesh; keep the mesh on trusted nodes. Repeat submissions hit the cache and a resident model
 instead of paying load time again.

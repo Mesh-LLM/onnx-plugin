@@ -41,6 +41,8 @@ Because this is the OpenAI-shaped route, `response_format` is accepted as the fo
 
 The initial adapter accepts bounded 16 kHz PCM16 or float WAV, mixing supported stereo input to mono, up to 30 seconds. Other encodings, sample rates, long-audio processing, translation, timestamps and realtime streaming are not silently approximated. Convert audio before upload if necessary. Model processor metadata fixes 80 Mel features and the audio context; these are not user knobs.
 
-`language` is `auto` or a language token supported by the pinned tokenizer. `max_output_tokens` is 1–448; termination also respects the model context, prompt length and end token. Decoding is greedy. Each request owns its decoder KV state; cancellation is checked between steps. Engines can be shared without sharing user audio state.
+`language` is `auto` or a language token supported by the pinned tokenizer. `max_output_tokens` is 1–444; termination also respects the model context, prompt length and end token. Decoding is greedy. Each request owns its decoder KV state; cancellation is checked between steps. Engines can be shared without sharing user audio state.
 
 This plugin serves the existing Mesh transcription route. Built-in Whisper can remain another provider of the same task. Graph compatibility and transcript quality are covered by the weight-dependent tests: the spoken fixture transcribes to its expected phrases with auto-detected `language = en`, and a second pass reproduces the transcript exactly (see [validation](TESTING.md)).
+
+WAVE_FORMAT_EXTENSIBLE files are accepted for PCM16 and IEEE float32 subformats. Finite float samples outside `[-1, 1]` are clipped before channel mixing; NaN and infinities are rejected. The pinned Tiny model makes two word substitutions on the speech fixture (`roots`/`note` for spoken `routes`/`node`); the complete expected output is recorded in [the fixture guide](../tests/fixtures/README.md).

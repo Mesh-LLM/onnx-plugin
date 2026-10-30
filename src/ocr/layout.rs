@@ -70,6 +70,16 @@ pub fn assemble(
     } else {
         ((0..n).collect(), vec![0; n], vec![0.0; n * n])
     };
+    Ok(assemble_ordered(lines, order, classes, same))
+}
+
+fn assemble_ordered(
+    lines: Vec<Line>,
+    order: Vec<usize>,
+    classes: Vec<usize>,
+    same: Vec<f32>,
+) -> Layout {
+    let n = lines.len();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for &index in &order {
         if groups
@@ -90,11 +100,11 @@ pub fn assemble(
         .into_iter()
         .map(|index| lines[index].clone())
         .collect();
-    Ok(Layout {
+    Layout {
         lines: ordered_lines,
         blocks,
         markdown,
-    })
+    }
 }
 
 fn line_features(lines: &[Line], width: f32, height: f32) -> Vec<f32> {
@@ -298,6 +308,30 @@ mod tests {
         assert_eq!(markdown(&blocks, false), "body");
         assert_eq!(markdown(&blocks, true), "letterhead\n\nbody\n\npage 1");
         assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn assembled_pages_omit_furniture_from_default_markdown_but_keep_structure() {
+        let lines = ["letterhead", "body", "page 1"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| Line {
+                text: text.into(),
+                bbox: [0.0, index as f32 * 20.0, 100.0, index as f32 * 20.0 + 10.0],
+                confidence: 1.0,
+            })
+            .collect();
+        // Class IDs are the OrderNet vocabulary, not preconstructed blocks.
+        let layout = assemble_ordered(lines, vec![0, 1, 2], vec![2, 0, 3], vec![0.0; 9]);
+        assert_eq!(layout.markdown, "body");
+        assert_eq!(layout.lines.len(), 3);
+        assert_eq!(layout.blocks.len(), 3);
+        assert_eq!(layout.blocks[0].label, "Page-Header");
+        assert_eq!(layout.blocks[2].label, "Page-Footer");
+        assert_eq!(
+            markdown(&layout.blocks, true),
+            "letterhead\n\nbody\n\npage 1"
+        );
     }
 
     #[test]

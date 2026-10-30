@@ -68,7 +68,9 @@ impl Recipe {
             .rsplit_once('@')
             .ok_or_else(|| anyhow::anyhow!("model must include an explicit @revision"))?;
         let kind = match repo {
-            "datalab-to/indra-ocr" if revision == "v1.1.0" => Kind::Indra,
+            "datalab-to/indra-ocr" if revision == "bd02167fdf2005a19962cc15188f8496a2c87d3b" => {
+                Kind::Indra
+            }
             "Xenova/clip-vit-base-patch32"
                 if revision == "6b7c523703ae26e39be4b03774966f8571c7f523" =>
             {
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_revisions_variants_and_model_knobs_before_acquisition() {
         assert!(Recipe::for_model(&config("datalab-to/indra-ocr@main")).is_err());
-        let mut config = config("datalab-to/indra-ocr@v1.1.0");
+        let mut config = config("datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b");
         assert_eq!(Recipe::for_model(&config).unwrap().threads, 4);
         config.variant = "int8".into();
         assert!(Recipe::for_model(&config).is_err());

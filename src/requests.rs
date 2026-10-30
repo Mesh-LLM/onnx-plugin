@@ -120,8 +120,8 @@ fn decode(kind: Kind, value: Value, request: bool) -> Result<RequestOptions> {
         }
         Kind::Whisper => {
             let options: WhisperOptions = serde_json::from_value(value)?;
-            if !(1..=448).contains(&options.max_output_tokens) {
-                bail!("max_output_tokens must be between 1 and 448");
+            if !(1..=444).contains(&options.max_output_tokens) {
+                bail!("max_output_tokens must be between 1 and 444");
             }
             if options.language != "auto"
                 && (options.language.len() < 2

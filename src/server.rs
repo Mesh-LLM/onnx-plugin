@@ -29,6 +29,8 @@ use std::{
 
 const MAX_FILE: usize = 64 * 1024 * 1024;
 static UPLOAD_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static VALIDATION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static TEXT_PDF_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 #[derive(Clone)]
 pub struct ServerState {
     pub registry: Arc<Registry>,
@@ -51,7 +53,7 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
     let data = state.registry.models.values().map(|model| {
         let state = model.state();
         json!({"id":model.config.model,"object":"model","variant":model.config.variant,
-            "workload_class":model.recipe.kind.workload(),"operations":[model.recipe.kind.operation()],
+            "assets_ready":model.assets_ready(),"workload_class":model.recipe.kind.workload(),"operations":[model.recipe.kind.operation()],
             "availability":if state == "unloaded" {"loadable"} else {state}})
     }).collect::<Vec<_>>();
     Json(json!({"object":"list","data":data}))
@@ -65,7 +67,7 @@ struct Upload {
 async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
     let mut file = None;
     let mut fields = BTreeMap::new();
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(ApiError::bad_request)?
@@ -91,10 +93,14 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
                     "too many or duplicate multipart fields",
                 ));
             }
-            let value = field.text().await.map_err(ApiError::bad_request)?;
-            if value.len() > 64 * 1024 {
-                return Err(ApiError::bad_request("multipart control exceeds 64 KiB"));
+            let mut value = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(ApiError::bad_request)? {
+                if value.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return Err(ApiError::bad_request("multipart control exceeds 64 KiB"));
+                }
+                value.extend_from_slice(&chunk);
             }
+            let value = String::from_utf8(value).map_err(ApiError::bad_request)?;
             fields.insert(name, value);
         }
     }
@@ -166,50 +172,75 @@ async fn task(
         _ => &[Representation::Json],
     };
     let accept = headers
-        .get("accept")
+        .get_all("accept")
+        .iter()
         .map(|value| value.to_str())
-        .transpose()
-        .map_err(ApiError::bad_request)?;
-    let mut format = Representation::negotiate(accept, supported)
-        .map_err(|error| ApiError::new(StatusCode::NOT_ACCEPTABLE, error))?;
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(ApiError::bad_request)?
+        .join(",");
     let mut upload = tokio::time::timeout_at(deadline, read_upload(multipart))
         .await
         .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "upload deadline exceeded"))??;
-    // The header decided a default before the body was read, so an
-    // unacceptable `Accept` is refused without consuming an upload. The
-    // OpenAI-shaped transcription route additionally lets the caller name the
-    // body in the form, which wins because it is that API's own mechanism. The
-    // field is removed so the task's own option schema never sees it.
-    if kind == Kind::Whisper
+    // OpenAI's body field takes precedence even over an unacceptable Accept.
+    // Remove it before validating the task's own options.
+    drop(_upload_permit);
+    let format = if kind == Kind::Whisper
         && let Some(requested) = upload.fields.remove("response_format")
     {
-        format = Representation::from_openai_response_format(&requested)
-            .map_err(ApiError::bad_request)?;
-    }
+        Representation::from_openai_response_format(&requested).map_err(ApiError::bad_request)?
+    } else {
+        Representation::negotiate(Some(&accept), supported)
+            .map_err(|error| ApiError::new(StatusCode::NOT_ACCEPTABLE, error))?
+    };
     let model = state
         .registry
         .select(&upload.model, kind)
         .map_err(ApiError::bad_request)?;
-    let options = requests::merge(kind, &model.config.request_defaults, upload.fields)
-        .map_err(ApiError::bad_request)?;
-    match &options {
-        RequestOptions::Ocr(options) => {
-            crate::pdf::validate_input(&upload.file, options).map_err(ApiError::processing)?
-        }
-        RequestOptions::Whisper(_) => {
-            crate::adapters::whisper::validate_wav(&upload.file).map_err(ApiError::bad_request)?
-        }
-        _ => {
-            decode_image(&upload.file).map_err(ApiError::bad_request)?;
-        }
-    }
+    let options = requests::merge(
+        kind,
+        &model.config.request_defaults,
+        std::mem::take(&mut upload.fields),
+    )
+    .map_err(ApiError::bad_request)?;
+    let permit = VALIDATION_PERMITS.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "validation capacity is full",
+        )
+    })?;
+    let (upload, options) = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match &options {
+                RequestOptions::Ocr(options) => crate::pdf::validate_input(&upload.file, options)
+                    .map_err(ApiError::processing)?,
+                RequestOptions::Whisper(_) => crate::adapters::whisper::validate_wav(&upload.file)
+                    .map_err(ApiError::bad_request)?,
+                _ => {
+                    decode_image(&upload.file).map_err(ApiError::bad_request)?;
+                }
+            }
+            Ok::<_, ApiError>((upload, options))
+        }),
+    )
+    .await
+    .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "validation deadline exceeded"))?
+    .map_err(ApiError::internal)??;
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancellation = cancel.0.clone();
     let result = tokio::time::timeout_at(deadline, async move {
         if let RequestOptions::Ocr(pdf_options) = &options
             && pdf_options.mode == crate::ocr::document::OcrMode::Text
         {
+            let text_permit = TEXT_PDF_PERMITS.try_acquire().map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "PDF worker capacity is full",
+                )
+            })?;
             return tokio::task::spawn_blocking(move || {
+                let _text_permit = text_permit;
                 let RequestOptions::Ocr(options) = options else {
                     unreachable!()
                 };
@@ -295,6 +326,7 @@ fn execute(
                 &options.labels,
                 options.top_k,
                 options.truncate_text,
+                cancel,
             )?;
             Ok(Payload::Value(
                 json!({"model":model,"scores":scores,"score_type":"cosine_similarity"}),
@@ -317,6 +349,9 @@ fn execute(
                 OutputResolution::Native
             };
             let depth = engine.depth(&decode_image(file)?, resolution)?;
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("request cancelled");
+            }
             // Asking for an image is itself the request for a preview, so the
             // representation decides rather than the `visualization` default.
             if format == Representation::Png {
@@ -400,6 +435,9 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, error)
     }
     fn processing(error: anyhow::Error) -> Self {
+        if error.is::<crate::adapters::InvalidRequest>() {
+            return Self::bad_request(error);
+        }
         let status = match error.downcast_ref::<crate::pdf::InputError>() {
             Some(crate::pdf::InputError::Invalid(_)) => StatusCode::BAD_REQUEST,
             Some(crate::pdf::InputError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE,
@@ -424,7 +462,7 @@ mod tests {
     use super::*;
     use mesh_llm_plugin::models::ManagedModelConfig;
     async fn server() -> (String, tokio::task::JoinHandle<()>) {
-        let config: ManagedModelConfig = serde_json::from_value(json!({"model":"datalab-to/indra-ocr@v1.1.0","provider":"onnx","lifecycle":{"load":"on_demand","prefetch":false}})).unwrap();
+        let config: ManagedModelConfig = serde_json::from_value(json!({"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","provider":"onnx","lifecycle":{"load":"on_demand","prefetch":false}})).unwrap();
         let registry = Arc::new(Registry::new(vec![config]).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -575,8 +613,18 @@ mod tests {
             ),
         ] {
             let mut form = reqwest::multipart::Form::new()
-                .text("model", "datalab-to/indra-ocr@v1.1.0")
-                .part("file", reqwest::multipart::Part::bytes(vec![1, 2, 3]));
+                .text(
+                    "model",
+                    "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
+                )
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(if path == "/v1/audio/transcriptions" {
+                        tiny_wav()
+                    } else {
+                        tiny_png()
+                    }),
+                );
             if let Some((key, value)) = extra {
                 form = form.text(key, value);
             }
@@ -589,6 +637,31 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_accept_headers_are_combined_before_negotiation() {
+        let (url, task) = server().await;
+        let form = reqwest::multipart::Form::new()
+            .text(
+                "model",
+                "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
+            )
+            .part("file", reqwest::multipart::Part::bytes(tiny_png()));
+        let response = reqwest::Client::new()
+            .post(format!("{url}/mesh/v1/documents/ocr"))
+            .header("Accept", "image/png")
+            .header("Accept", "application/json")
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the second header permits JSON, then assets are unavailable"
+        );
         task.abort();
     }
 

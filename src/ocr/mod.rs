@@ -19,7 +19,7 @@ use self::layout::{Block, assemble};
 use self::orientation::orient;
 use self::recognition::Recognizers;
 
-const MODEL: &str = "datalab-to/indra-ocr@v1.1.0";
+const MODEL: &str = "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Line {

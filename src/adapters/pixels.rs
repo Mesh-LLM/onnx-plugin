@@ -13,23 +13,21 @@ pub(super) fn validate_image(image: &DynamicImage) -> Result<()> {
 
 pub(super) fn center_crop(image: &DynamicImage, size: u32) -> Result<RgbImage> {
     validate_image(image)?;
-    let rgb = image.to_rgb8();
-    let scale = f64::from(size) / f64::from(rgb.width().min(rgb.height()));
-    let width = (f64::from(rgb.width()) * scale)
-        .floor()
-        .max(f64::from(size)) as u32;
-    let height = (f64::from(rgb.height()) * scale)
-        .floor()
-        .max(f64::from(size)) as u32;
-    let resized = image::imageops::resize(&rgb, width, height, FilterType::CatmullRom);
-    Ok(image::imageops::crop_imm(
-        &resized,
-        (width - size) / 2,
-        (height - size) / 2,
+    let side = image.width().min(image.height());
+    let crop = image
+        .crop_imm(
+            (image.width() - side) / 2,
+            (image.height() - side) / 2,
+            side,
+            side,
+        )
+        .to_rgb8();
+    Ok(image::imageops::resize(
+        &crop,
         size,
         size,
-    )
-    .to_image())
+        FilterType::CatmullRom,
+    ))
 }
 
 pub(super) fn normalized_chw(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
@@ -62,6 +60,17 @@ mod tests {
         let chw = normalized_chw(&cropped, [0.0; 3], [1.0; 3]);
         assert_eq!(&chw[..4], &[0.0; 4]);
         assert_eq!(&chw[4..8], &[1.0; 4]);
+    }
+
+    #[test]
+    fn thin_images_do_not_expand_the_long_axis_before_cropping() {
+        // Resizing the short edge first would allocate a 224 x 224,000 strip.
+        // Only the square central pixel contributes to this input.
+        let mut image = RgbImage::from_pixel(1000, 1, Rgb([255, 0, 0]));
+        image.put_pixel(499, 0, Rgb([0, 255, 0]));
+        let cropped = center_crop(&DynamicImage::ImageRgb8(image), 224).unwrap();
+        assert_eq!(cropped.dimensions(), (224, 224));
+        assert!(cropped.pixels().all(|pixel| *pixel == Rgb([0, 255, 0])));
     }
 
     #[test]

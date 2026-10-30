@@ -31,7 +31,7 @@ pub struct Model {
     pub residency: Residency<Engine>,
     assets: OnceCell<PreparedModelAssets>,
     context: Arc<OnceLock<PluginContext<'static>>>,
-    failure: Arc<Mutex<Option<Instant>>>,
+    failure: Arc<Mutex<Option<(Instant, String)>>>,
 }
 
 pub struct Registry {
@@ -110,6 +110,10 @@ impl Registry {
 }
 
 impl Model {
+    pub fn assets_ready(&self) -> bool {
+        self.assets.initialized()
+    }
+
     pub fn state(&self) -> &'static str {
         if self.in_backoff() {
             "failed"
@@ -119,8 +123,15 @@ impl Model {
     }
 
     fn in_backoff(&self) -> bool {
-        self.failure.lock().map_or(true, |failure| {
-            failure.is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        self.recent_failure().is_some()
+    }
+
+    fn recent_failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| {
+            failure
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(5))
+                .map(|(_, message)| message.clone())
         })
     }
 
@@ -154,30 +165,29 @@ impl Model {
                 context.prepare_model_assets(&self.recipe.plan).await
             })
             .await
+            .inspect_err(|error| {
+                if let Ok(mut failure) = self.failure.lock() {
+                    *failure = Some((Instant::now(), error.to_string()));
+                }
+            })
     }
 
     pub async fn acquire(&self) -> Result<EngineLease<Engine>> {
         let mut lease = self.residency.acquire().await?;
         if lease.engine().is_none() {
-            if self.in_backoff() {
-                bail!("model load failed recently; retry after 5 seconds");
+            if let Some(message) = self.recent_failure() {
+                bail!("{message}");
             }
-            let directory: PathBuf = self
-                .assets()
-                .await
-                .inspect_err(|_| {
-                    if let Ok(mut failure) = self.failure.lock() {
-                        *failure = Some(Instant::now());
-                    }
-                })?
-                .directory
-                .clone();
+            let directory: PathBuf = self.assets().await?.directory.clone();
             let recipe = self.recipe.clone();
             let failure = self.failure.clone();
             lease = tokio::task::spawn_blocking(move || {
                 let result = load_engine(&recipe, &directory);
                 if let Ok(mut failure) = failure.lock() {
-                    *failure = result.as_ref().err().map(|_| Instant::now());
+                    *failure = result
+                        .as_ref()
+                        .err()
+                        .map(|error| (Instant::now(), error.to_string()));
                 }
                 let engine = result?;
                 *lease.engine() = Some(engine);
@@ -214,4 +224,35 @@ fn load_engine(recipe: &Recipe, directory: &Path) -> Result<Engine> {
         recipe.threads,
         variant,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_failed_loads_share_the_cause_and_prefetch_marks_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let config:ManagedModelConfig=serde_json::from_value(serde_json::json!({
+            "model":"Xenova/clip-vit-base-patch32@6b7c523703ae26e39be4b03774966f8571c7f523", "provider":"onnx",
+            "source":{"local_dir":root.path()}, "lifecycle":{"load":"on_demand","prefetch":true}
+        })).unwrap();
+        let registry = Registry::new(vec![config]).unwrap();
+        let model = registry.models.values().next().unwrap();
+        // The same asset-preparation entry point is used by startup prefetch.
+        let prefetch = model.assets().await.unwrap_err().to_string();
+        assert_eq!(model.state(), "failed");
+        assert!(!model.assets_ready());
+        let (a, b) = tokio::join!(model.acquire(), model.acquire());
+        let a = a.err().unwrap().to_string();
+        let b = b.err().unwrap().to_string();
+        assert_eq!(a, prefetch);
+        assert_eq!(b, prefetch);
+        assert!(a.contains("required model asset is missing"), "{a}");
+        *model.failure.lock().unwrap() = Some((Instant::now() - Duration::from_secs(6), a));
+        assert_eq!(
+            model.state(),
+            "unloaded",
+            "backoff must expire to allow retry"
+        );
+    }
 }

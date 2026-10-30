@@ -55,7 +55,21 @@ impl Representation {
                 .next()
                 .unwrap_or("");
             let mut preference = None;
-            for (range, quality) in &ranges {
+            for (range, quality, parameters) in &ranges {
+                if !parameters.iter().all(|(key, value)| {
+                    representation
+                        .content_type()
+                        .split(';')
+                        .skip(1)
+                        .any(|part| {
+                            part.trim().split_once('=').is_some_and(|(k, v)| {
+                                k.eq_ignore_ascii_case(key)
+                                    && v.trim_matches('"').eq_ignore_ascii_case(value)
+                            })
+                        })
+                }) {
+                    continue;
+                }
                 let specificity = if range.eq_ignore_ascii_case(media) {
                     2
                 } else if range == "*/*" {
@@ -67,6 +81,7 @@ impl Representation {
                 } else {
                     continue;
                 };
+                let specificity = (specificity, parameters.len());
                 if preference.is_none_or(|(previous, _)| specificity > previous) {
                     preference = Some((specificity, *quality));
                 }
@@ -84,7 +99,8 @@ impl Representation {
     }
 }
 
-fn parse_ranges(accept: &str) -> Result<Vec<(String, f32)>> {
+type MediaRange = (String, f32, Vec<(String, String)>);
+fn parse_ranges(accept: &str) -> Result<Vec<MediaRange>> {
     let mut ranges = Vec::new();
     for entry in accept.split(',') {
         let mut parts = entry.trim().split(';');
@@ -93,17 +109,23 @@ fn parse_ranges(accept: &str) -> Result<Vec<(String, f32)>> {
             bail!("invalid Accept media range");
         }
         let mut quality = 1.0;
+        let mut parameters = Vec::new();
         for parameter in parts {
-            if let Some((name, value)) = parameter.trim().split_once('=')
-                && name.trim().eq_ignore_ascii_case("q")
-            {
+            if let Some((name, value)) = parameter.trim().split_once('=') {
+                if !name.trim().eq_ignore_ascii_case("q") {
+                    parameters.push((
+                        name.trim().to_ascii_lowercase(),
+                        value.trim().trim_matches('"').to_ascii_lowercase(),
+                    ));
+                    continue;
+                }
                 quality = value.trim().parse::<f32>()?;
                 if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
                     bail!("invalid Accept quality");
                 }
             }
         }
-        ranges.push((media, quality));
+        ranges.push((media, quality, parameters));
     }
     Ok(ranges)
 }
@@ -116,6 +138,24 @@ mod tests {
         Representation::Text,
         Representation::Markdown,
     ];
+
+    #[test]
+    fn media_parameters_constrain_the_representation_and_precedence() {
+        assert!(Representation::negotiate(Some("text/plain; charset=iso-8859-1"), ALL).is_err());
+        assert_eq!(
+            Representation::negotiate(Some("text/plain; charset=\"UTF-8\""), ALL).unwrap(),
+            Representation::Text
+        );
+        assert_eq!(
+            Representation::negotiate(
+                Some("text/plain; charset=utf-8;q=0, text/plain;q=1, application/json;q=0.5"),
+                ALL
+            )
+            .unwrap(),
+            Representation::Json
+        );
+        assert!(Representation::negotiate(Some("application/json;profile=unknown"), ALL).is_err());
+    }
 
     #[test]
     fn defaults_and_quality_values_choose_a_supported_representation() {

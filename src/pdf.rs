@@ -146,7 +146,7 @@ pub fn process_cancellable(
         )?]
     };
     Ok(Document {
-        model: "datalab-to/indra-ocr@v1.1.0",
+        model: "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
         pages,
     })
 }
@@ -232,7 +232,17 @@ fn process_page(
             options.keep_furniture,
         );
     }
-    let mut lines = text_lines(page, config, image.width(), image.height())?;
+    let mut lines = match text_lines(page, config, image.width(), image.height()) {
+        Ok(lines) => lines,
+        Err(_) if options.mode == OcrMode::Auto => {
+            return required_engine(engine)?.recognize_image_with_options(
+                &image,
+                index,
+                options.keep_furniture,
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if options.mode == OcrMode::Auto && !text_layer_usable(&lines, image.width(), image.height()) {
         return required_engine(engine)?.recognize_image_with_options(
             &image,
@@ -241,23 +251,19 @@ fn process_page(
         );
     }
     let mut hybrid = false;
-    if options.image_ocr {
+    if options.image_ocr && options.mode != OcrMode::Text {
         let regions = image_regions(page, config, image.width(), image.height())?;
         if !regions.is_empty() {
             let engine = required_engine(engine)?;
             for region in regions {
                 check_cancelled(cancel)?;
+                let before = lines.len();
                 append_image_ocr(&image, region, &mut lines, engine, index, options)?;
-                hybrid = true;
+                hybrid |= lines.len() > before;
             }
         }
     }
     if hybrid {
-        lines.sort_by(|a, b| {
-            a.bbox[1]
-                .total_cmp(&b.bbox[1])
-                .then(a.bbox[0].total_cmp(&b.bbox[0]))
-        });
         page_from_hybrid_lines(
             lines,
             index,
@@ -299,7 +305,7 @@ fn text_lines(
             )
         })
         .collect::<Result<Vec<_>>>()
-        .map(|lines| lines.into_iter().flatten().collect())
+        .map(|lines| group_text_segments(lines.into_iter().flatten().collect()))
 }
 
 fn rect_pixels(
@@ -336,21 +342,83 @@ fn rect_pixels(
     Ok((bbox[2] > bbox[0] && bbox[3] > bbox[1]).then_some(bbox))
 }
 
-fn contains_image(object: &PdfPageObject<'_>, depth: usize) -> Result<bool> {
-    if object.as_image_object().is_some() {
-        return Ok(true);
-    }
-    if let Some(form) = object.as_x_object_form_object() {
-        if depth >= 16 {
-            bail!("PDF image nesting exceeds supported depth");
-        }
-        for index in form.as_range() {
-            if contains_image(&form.get(index)?, depth + 1)? {
-                return Ok(true);
+// Preserve the text extractor's column order. Only adjacent, nearby segments
+// sharing a baseline form a line; distant columns must never be joined.
+fn group_text_segments(segments: Vec<Line>) -> Vec<Line> {
+    let mut lines: Vec<Line> = Vec::new();
+    for segment in segments {
+        if let Some(previous) = lines.last_mut() {
+            let a = previous.bbox;
+            let b = segment.bbox;
+            let height = (a[3] - a[1]).min(b[3] - b[1]);
+            let overlap = a[3].min(b[3]) - a[1].max(b[1]);
+            let gap = b[0] - a[2];
+            if overlap >= height * 0.6 && gap >= -height * 0.25 && gap <= height * 1.5 {
+                // Pdfium already supplies inferred spaces. Ink-bound gaps can
+                // split ligatures such as `fi`, so preserve extracted spelling.
+                previous.text.push_str(&segment.text);
+                previous.bbox = [
+                    a[0].min(b[0]),
+                    a[1].min(b[1]),
+                    a[2].max(b[2]),
+                    a[3].max(b[3]),
+                ];
+                continue;
             }
         }
+        lines.push(segment);
     }
-    Ok(false)
+    lines
+}
+
+fn collect_image_rects(
+    object: &PdfPageObject<'_>,
+    ancestors: &mut Vec<PdfMatrix>,
+    rects: &mut Vec<PdfRect>,
+) -> Result<()> {
+    if object.as_image_object().is_some() {
+        if rects.len() >= MAX_IMAGE_REGIONS {
+            bail!("PDF page exceeds 256 image regions");
+        }
+        let rect = object.bounds()?.to_rect();
+        let corners = [
+            (rect.left(), rect.bottom()),
+            (rect.right(), rect.bottom()),
+            (rect.left(), rect.top()),
+            (rect.right(), rect.top()),
+        ];
+        let mut bounds = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for (mut x, mut y) in corners {
+            for matrix in ancestors.iter().rev() {
+                (x, y) = matrix.apply_to_points(x, y);
+            }
+            bounds[0] = bounds[0].min(x.value);
+            bounds[1] = bounds[1].min(y.value);
+            bounds[2] = bounds[2].max(x.value);
+            bounds[3] = bounds[3].max(y.value);
+        }
+        rects.push(PdfRect::new(
+            PdfPoints::new(bounds[1]),
+            PdfPoints::new(bounds[0]),
+            PdfPoints::new(bounds[3]),
+            PdfPoints::new(bounds[2]),
+        ));
+    } else if let Some(form) = object.as_x_object_form_object() {
+        if ancestors.len() >= 16 {
+            bail!("PDF image nesting exceeds supported depth");
+        }
+        ancestors.push(form.matrix()?);
+        for index in form.as_range() {
+            collect_image_rects(&form.get(index)?, ancestors, rects)?;
+        }
+        ancestors.pop();
+    }
+    Ok(())
 }
 
 fn image_regions(
@@ -359,20 +427,33 @@ fn image_regions(
     width: u32,
     height: u32,
 ) -> Result<Vec<[f32; 4]>> {
-    let mut regions = Vec::new();
+    let mut rects = Vec::new();
     for object in page.objects().iter() {
-        if contains_image(&object, 0)? {
-            if regions.len() >= MAX_IMAGE_REGIONS {
-                bail!("PDF page exceeds 256 image regions");
-            }
-            if let Some(rect) =
-                rect_pixels(page, object.bounds()?.to_rect(), config, width, height)?
-            {
-                regions.push(rect);
-            }
-        }
+        collect_image_rects(&object, &mut Vec::new(), &mut rects)?;
     }
-    Ok(regions)
+    rects
+        .into_iter()
+        .map(|rect| rect_pixels(page, rect, config, width, height))
+        .collect::<Result<Vec<_>>>()
+        .map(|regions| regions.into_iter().flatten().collect())
+}
+
+// Insert within the matching column without re-sorting the extractor's lines.
+fn insert_image_line(lines: &mut Vec<Line>, line: Line) {
+    let position = lines
+        .iter()
+        .position(|prior| {
+            prior.bbox[0] < line.bbox[2]
+                && prior.bbox[2] > line.bbox[0]
+                && prior.bbox[1] >= line.bbox[3]
+        })
+        .unwrap_or_else(|| {
+            lines
+                .iter()
+                .rposition(|prior| prior.bbox[0] < line.bbox[2] && prior.bbox[2] > line.bbox[0])
+                .map_or(lines.len(), |index| index + 1)
+        });
+    lines.insert(position, line);
 }
 
 fn append_image_ocr(
@@ -389,7 +470,19 @@ fn append_image_ocr(
     }
     let crop = image::imageops::crop_imm(page, x0, y0, x1 - x0, y1 - y0).to_image();
     let result = engine.recognize_image_with_options(&crop, index, options.keep_furniture)?;
-    for mut line in result.lines {
+    for (position, original) in result.lines.iter().enumerate() {
+        if original.text.trim().is_empty()
+            || result
+                .lines
+                .iter()
+                .enumerate()
+                .any(|(other_position, other)| {
+                    position != other_position && redundant_subline(original, other)
+                })
+        {
+            continue;
+        }
+        let mut line = original.clone();
         line.bbox = restore_crop_box(
             line.bbox,
             crop.width(),
@@ -405,10 +498,26 @@ fn append_image_ocr(
             .iter()
             .any(|prior| prior.text.trim() == line.text.trim() && overlaps(prior.bbox, line.bbox))
         {
-            lines.push(line);
+            insert_image_line(lines, line);
         }
     }
     Ok(())
+}
+
+// Detectors can produce both a full line and a contained glyph crop. The latter
+// adds no content when its text already occurs in the enclosing recognized line.
+fn redundant_subline(line: &Line, enclosing: &Line) -> bool {
+    let text = line.text.trim();
+    let other = enclosing.text.trim();
+    if other.len() <= text.len() || !other.contains(text) {
+        return false;
+    }
+    let a = line.bbox;
+    let b = enclosing.bbox;
+    let area = (a[2] - a[0]) * (a[3] - a[1]);
+    let overlap =
+        (a[2].min(b[2]) - a[0].max(b[0])).max(0.0) * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    area > 0.0 && overlap >= area * 0.9
 }
 
 fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
@@ -583,5 +692,296 @@ mod tests {
         assert!(
             (second.pages[0].lines[0].bbox[0] - 2.0 * first.pages[0].lines[0].bbox[0]).abs() <= 2.0
         );
+    }
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    fn line(text: &str, bbox: [f32; 4]) -> Line {
+        Line {
+            text: text.to_owned(),
+            bbox,
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn styled_segments_join_without_merging_distant_columns_or_rows() {
+        let lines = group_text_segments(vec![
+            line("Styled", [10.0, 10.0, 50.0, 20.0]),
+            line(" words", [50.0, 10.0, 90.0, 20.0]),
+            line("right column", [200.0, 10.0, 290.0, 20.0]),
+            line("next row", [10.0, 30.0, 90.0, 40.0]),
+        ]);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Styled words", "right column", "next row"]
+        );
+        assert_eq!(lines[0].bbox, [10.0, 10.0, 90.0, 20.0]);
+    }
+
+    #[test]
+    fn ink_gaps_inside_words_do_not_invent_spaces() {
+        let lines = group_text_segments(vec![
+            line("fi", [10.0, 10.0, 20.0, 20.0]),
+            line("rst", [22.0, 10.0, 40.0, 20.0]),
+        ]);
+        assert_eq!(lines[0].text, "first");
+    }
+
+    #[test]
+    fn duplicate_glyph_crops_are_removed_only_inside_matching_text() {
+        let enclosing = line("IMAGE OCR WORDS", [10.0, 10.0, 100.0, 30.0]);
+        assert!(redundant_subline(
+            &line("D", [70.0, 10.0, 80.0, 30.2]),
+            &enclosing
+        ));
+        assert!(!redundant_subline(
+            &line("D", [70.0, 50.0, 80.0, 60.0]),
+            &enclosing
+        ));
+        assert!(!redundant_subline(
+            &line("X", [70.0, 10.0, 80.0, 30.0]),
+            &enclosing
+        ));
+    }
+
+    #[test]
+    fn image_text_insertion_preserves_column_reading_order() {
+        let mut lines = vec![
+            line("left top", [10.0, 10.0, 90.0, 20.0]),
+            line("left bottom", [10.0, 80.0, 90.0, 90.0]),
+            line("right top", [200.0, 10.0, 290.0, 20.0]),
+            line("right bottom", [200.0, 80.0, 290.0, 90.0]),
+        ];
+        insert_image_line(&mut lines, line("left image", [10.0, 40.0, 90.0, 60.0]));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "left top",
+                "left image",
+                "left bottom",
+                "right top",
+                "right bottom"
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; opens a real password-protected PDF"]
+    fn real_encrypted_pdf_requires_the_correct_password() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let data = fixture("encrypted.pdf");
+        let mut options = PdfOptions {
+            mode: OcrMode::Text,
+            ..PdfOptions::default()
+        };
+        for password in [None, Some("incorrect-password")] {
+            options.password = password.map(str::to_owned);
+            let error = process(&data, Some(Path::new(&library)), &options, None).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<InputError>(),
+                Some(InputError::Invalid(_))
+            ));
+            assert!(!error.to_string().contains("incorrect-password"));
+        }
+        options.password = Some("fixture-password".to_owned());
+        let document = process(&data, Some(Path::new(&library)), &options, None).unwrap();
+        assert_eq!(document.pages[0].source, "text");
+        assert!(document.pages[0].text.contains("embedded blank image"));
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; exercises image-containing PDFs without ONNX sessions"]
+    fn real_text_mode_ignores_images_and_groups_styled_segments() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        // image_ocr deliberately remains true: explicit text mode must never need an engine.
+        let options = PdfOptions {
+            mode: OcrMode::Text,
+            dpi: 72,
+            ..PdfOptions::default()
+        };
+        let document = process(
+            &fixture("text-with-image.pdf"),
+            Some(Path::new(&library)),
+            &options,
+            None,
+        )
+        .unwrap();
+        assert_eq!(document.pages[0].source, "text");
+        assert!(document.pages[0].text.contains("embedded blank image"));
+        let styled = process(
+            &fixture("text-segments.pdf"),
+            Some(Path::new(&library)),
+            &options,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            styled.pages[0].lines.len(),
+            3,
+            "{:?}",
+            styled.pages[0].lines
+        );
+        assert!(styled.pages[0].lines[0].text.contains("Styled"));
+        assert!(styled.pages[0].lines[0].text.contains("words"));
+        assert!(!styled.pages[0].lines[0].text.contains("column"));
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY and ONNX_OCR_MODEL_DIR; real hybrid and blank-image OCR"]
+    fn real_hybrid_pdf_adds_image_words_without_reordering_text_columns() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let directory = std::env::var("ONNX_OCR_MODEL_DIR").expect("ONNX_OCR_MODEL_DIR");
+        let mut engine = Engine::load(Path::new(&directory)).unwrap();
+        let mut options = PdfOptions::default();
+        let blank = process(
+            &fixture("text-with-image.pdf"),
+            Some(Path::new(&library)),
+            &options,
+            Some(&mut engine),
+        )
+        .unwrap();
+        assert_eq!(
+            blank.pages[0].source, "text",
+            "a blank image adds no OCR text"
+        );
+        options.mode = OcrMode::Text;
+        let baseline = process(
+            &fixture("hybrid.pdf"),
+            Some(Path::new(&library)),
+            &options,
+            None,
+        )
+        .unwrap();
+        options.mode = OcrMode::Auto;
+        let hybrid = process(
+            &fixture("hybrid.pdf"),
+            Some(Path::new(&library)),
+            &options,
+            Some(&mut engine),
+        )
+        .unwrap();
+        assert_eq!(hybrid.pages[0].source, "hybrid");
+        assert!(
+            hybrid.pages[0].text.contains("IMAGE OCR WORDS"),
+            "{}",
+            hybrid.pages[0].text
+        );
+        assert_eq!(
+            hybrid.pages[0].lines.len(),
+            baseline.pages[0].lines.len() + 1,
+            "{:?}",
+            hybrid.pages[0].lines
+        );
+        let preserved = hybrid.pages[0]
+            .lines
+            .iter()
+            .filter(|line| {
+                baseline.pages[0]
+                    .lines
+                    .iter()
+                    .any(|original| original.text == line.text && original.bbox == line.bbox)
+            })
+            .map(|line| line.text.trim())
+            .collect::<Vec<_>>();
+        let expected = baseline.pages[0]
+            .lines
+            .iter()
+            .map(|line| line.text.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preserved, expected,
+            "adding image OCR must not interleave PDF text columns"
+        );
+        let image = hybrid.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text.contains("IMAGE OCR WORDS"))
+            .unwrap();
+        assert!(
+            image.bbox[0] >= 100.0 && image.bbox[2] <= 840.0,
+            "{:?}",
+            image.bbox
+        );
+    }
+
+    fn pdf_objects(objects: Vec<Vec<u8>>) -> Vec<u8> {
+        use std::io::Write;
+        let mut output = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0];
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(output.len());
+            writeln!(output, "{} 0 obj", index + 1).unwrap();
+            output.extend_from_slice(object);
+            output.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = output.len();
+        writeln!(output, "xref\n0 {}\n0000000000 65535 f ", offsets.len()).unwrap();
+        for offset in &offsets[1..] {
+            writeln!(output, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            output,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF",
+            offsets.len()
+        )
+        .unwrap();
+        output
+    }
+
+    fn stream(dictionary: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut output =
+            format!("<< {dictionary} /Length {} >>\nstream\n", bytes.len()).into_bytes();
+        output.extend_from_slice(bytes);
+        output.extend_from_slice(b"\nendstream");
+        output
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; inspects image bounds inside two transformed PDF forms"]
+    fn real_nested_form_extracts_image_bounds_instead_of_surrounding_text() {
+        let data = pdf_objects(vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /XObject << /Fm 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /XObject << /Inner 6 0 R >> /Font << /F1 8 0 R >> >>",
+                b"BT /F1 12 Tf 0 180 Td (Form text must stay outside the image region) Tj ET q 1 0 0 1 20 30 cm /Inner Do Q"),
+            stream("", b"q 1 0 0 1 50 60 cm /Fm Do Q"),
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im 7 0 R >> >>",
+                b"q 40 0 0 20 10 15 cm /Im Do Q"),
+            stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[255]),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let lock = PDFIUM_BIND_LOCK.lock().unwrap();
+        let pdfium = match Pdfium::bind_to_library(Path::new(&library)) {
+            Ok(bindings) => Pdfium::new(bindings),
+            Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Pdfium::default(),
+            Err(error) => panic!("load Pdfium: {error}"),
+        };
+        drop(lock);
+        let document = pdfium.load_pdf_from_byte_vec(data, None).unwrap();
+        let page = document.pages().get(0).unwrap();
+        let regions = image_regions(&page, &PdfRenderConfig::new(), 300, 300).unwrap();
+        assert_eq!(regions.len(), 1);
+        for (actual, expected) in regions[0].iter().zip([80.0, 175.0, 120.0, 195.0]) {
+            assert!(
+                (actual - expected).abs() <= 1.0,
+                "actual image bounds: {:?}",
+                regions[0]
+            );
+        }
     }
 }

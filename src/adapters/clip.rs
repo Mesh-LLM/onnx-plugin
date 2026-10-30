@@ -1,6 +1,7 @@
 //! CLIP dual-encoder inference and cosine similarity ranking.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use image::DynamicImage;
@@ -112,17 +113,24 @@ impl Clip {
         labels: &[String],
         top_k: usize,
         truncate: bool,
+        cancel: &AtomicBool,
     ) -> Result<Vec<LabelScore>> {
         if labels.is_empty() || labels.len() > 256 {
             bail!("provide between 1 and 256 labels");
         }
-        if top_k == 0 || top_k > labels.len() {
+        if top_k == 0 {
             bail!("top_k must be between 1 and the number of labels");
+        }
+        if cancel.load(Ordering::Relaxed) {
+            bail!("request cancelled");
         }
         let image = self.image_embedding(image)?;
         let mut scores = labels
             .iter()
             .map(|label| {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("request cancelled");
+                }
                 let text = self.text_embedding(label, truncate)?;
                 Ok(LabelScore {
                     label: label.clone(),
@@ -242,10 +250,29 @@ mod tests {
             assert_eq!(vision.len(), 512);
             assert_eq!(text.len(), 512);
             assert!(cosine(&vision, &text).unwrap().is_finite());
-            let ranked = engine.rank(&image, &labels, labels.len(), false).unwrap();
+            assert!(
+                engine
+                    .rank(&image, &labels, 1, false, &AtomicBool::new(true))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cancelled")
+            );
+            // top_k is an upper bound; the HTTP default of three is valid with
+            // a caller supplying just two labels.
+            let ranked = engine
+                .rank(
+                    &image,
+                    &labels,
+                    labels.len() + 1,
+                    false,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert_eq!(ranked.len(), labels.len());
             // The fixture is a photographed letter, so the text label must win
             // over the photo-of-a-dog and chart labels.
             assert_eq!(ranked[0].label, labels[0], "{variable} ranked {ranked:?}");
+            assert!(ranked[0].score > 0.2);
             rankings.push((variable, ranked));
         }
         assert!(

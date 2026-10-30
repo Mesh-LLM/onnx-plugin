@@ -59,7 +59,18 @@ pub(super) fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn decode_samples(format: &[u8], data: &[u8]) -> Result<Vec<f32>> {
-    let encoding = u16::from_le_bytes(format[..2].try_into()?);
+    let mut encoding = u16::from_le_bytes(format[..2].try_into()?);
+    if encoding == 0xfffe {
+        if format.len() < 40
+            || u16::from_le_bytes(format[16..18].try_into()?) < 22
+            || format[26..40] != [0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]
+            || u16::from_le_bytes(format[18..20].try_into()?)
+                != u16::from_le_bytes(format[14..16].try_into()?)
+        {
+            bail!("invalid extensible WAV subformat");
+        }
+        encoding = u16::from_le_bytes(format[24..26].try_into()?);
+    }
     let channels = usize::from(u16::from_le_bytes(format[2..4].try_into()?));
     let rate = u32::from_le_bytes(format[4..8].try_into()?);
     let align = usize::from(u16::from_le_bytes(format[12..14].try_into()?));
@@ -87,10 +98,10 @@ fn decode_samples(format: &[u8], data: &[u8]) -> Result<Vec<f32>> {
                 } else {
                     f32::from_le_bytes(channel.try_into()?)
                 };
-                if !value.is_finite() || value.abs() > 1.0 {
-                    bail!("WAV contains invalid/non-normalized audio samples");
+                if !value.is_finite() {
+                    bail!("WAV contains nonfinite audio samples");
                 }
-                sum += value;
+                sum += value.clamp(-1.0, 1.0);
             }
             Ok(sum / channels as f32)
         })
@@ -258,6 +269,69 @@ mod tests {
         let mut rate = wav(&[1, 2], 1);
         rate[24..28].copy_from_slice(&44100_u32.to_le_bytes());
         assert!(decode_wav(&rate).is_err());
+    }
+
+    fn formatted_wav(format: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend((20 + format.len() as u32 + data.len() as u32).to_le_bytes());
+        bytes.extend(b"WAVEfmt ");
+        bytes.extend((format.len() as u32).to_le_bytes());
+        bytes.extend(format);
+        bytes.extend(b"data");
+        bytes.extend((data.len() as u32).to_le_bytes());
+        bytes.extend(data);
+        bytes
+    }
+
+    #[test]
+    fn extensible_wav_accepts_pcm_and_float_guids_but_rejects_unknown_formats() {
+        for (encoding, bits, data) in [
+            (1u16, 16u16, 16384i16.to_le_bytes().to_vec()),
+            (3u16, 32u16, 0.5f32.to_le_bytes().to_vec()),
+        ] {
+            let mut format = Vec::new();
+            format.extend(0xfffeu16.to_le_bytes());
+            format.extend(1u16.to_le_bytes());
+            format.extend(16000u32.to_le_bytes());
+            format.extend((16000u32 * u32::from(bits / 8)).to_le_bytes());
+            format.extend((bits / 8).to_le_bytes());
+            format.extend(bits.to_le_bytes());
+            format.extend(22u16.to_le_bytes());
+            format.extend(bits.to_le_bytes());
+            format.extend(4u32.to_le_bytes()); // mono speaker mask
+            format.extend(u32::from(encoding).to_le_bytes());
+            format.extend([0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]);
+            assert_eq!(decode_wav(&formatted_wav(&format, &data)).unwrap(), [0.5]);
+            format[39] ^= 1;
+            assert!(decode_wav(&formatted_wav(&format, &data)).is_err());
+        }
+    }
+
+    #[test]
+    fn floating_wav_clips_finite_samples_before_mixing_and_rejects_nonfinite_values() {
+        let mut format = Vec::new();
+        format.extend(3u16.to_le_bytes());
+        format.extend(2u16.to_le_bytes());
+        format.extend(16000u32.to_le_bytes());
+        format.extend(128000u32.to_le_bytes());
+        format.extend(8u16.to_le_bytes());
+        format.extend(32u16.to_le_bytes());
+        let samples = [f32::MAX, f32::MAX, -2.0, 0.5];
+        let data = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_wav(&formatted_wav(&format, &data)).unwrap(),
+            [1.0, -0.25]
+        );
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let data = [value, 0.0]
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>();
+            assert!(decode_wav(&formatted_wav(&format, &data)).is_err());
+        }
     }
 
     #[test]

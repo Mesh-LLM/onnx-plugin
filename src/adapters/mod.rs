@@ -17,6 +17,15 @@ pub use clip::LabelScore;
 pub use depth::{DepthMap, OutputResolution};
 pub use whisper::Transcription;
 
+#[derive(Debug)]
+pub struct InvalidRequest(pub &'static str);
+impl std::fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for InvalidRequest {}
+
 /// Native task implementation selected by a compatible model recipe.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -78,9 +87,10 @@ impl Engine {
         labels: &[String],
         top_k: usize,
         truncate_text: bool,
+        cancel: &AtomicBool,
     ) -> Result<Vec<LabelScore>> {
         match self {
-            Self::Clip(engine) => engine.rank(image, labels, top_k, truncate_text),
+            Self::Clip(engine) => engine.rank(image, labels, top_k, truncate_text, cancel),
             _ => bail!("model does not support image/text ranking"),
         }
     }
@@ -172,16 +182,39 @@ fn vector_output(
     let output = outputs
         .get(name)
         .with_context(|| format!("model output {name} missing"))?;
-    let (_, data) = output.try_extract_tensor::<f32>()?;
+    let (shape, data) = output.try_extract_tensor::<f32>()?;
+    validate_vector(shape, data, name, expected)?;
+    Ok(data.to_vec())
+}
+
+fn validate_vector(shape: &[i64], data: &[f32], name: &str, expected: usize) -> Result<()> {
+    if !matches!(shape, [n] if *n == expected as i64)
+        && !matches!(shape, [1, n] if *n == expected as i64)
+    {
+        bail!("invalid {name} embedding shape: {shape:?}");
+    }
     if data.len() != expected || data.iter().any(|value| !value.is_finite()) {
         bail!("invalid {name} embedding: expected {expected} finite elements");
     }
-    Ok(data.to_vec())
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_output_requires_one_vector_not_just_matching_element_count() {
+        let values = [0.0; 4];
+        for shape in [&[4][..], &[1, 4][..]] {
+            assert!(validate_vector(shape, &values, "embedding", 4).is_ok());
+        }
+        for shape in [&[2, 2][..], &[1, 1, 4][..], &[4, 1][..]] {
+            assert!(validate_vector(shape, &values, "embedding", 4).is_err());
+        }
+        assert!(validate_vector(&[4], &[f32::NAN; 4], "embedding", 4).is_err());
+        assert!(validate_vector(&[4], &[0.0; 3], "embedding", 4).is_err());
+    }
 
     #[test]
     fn depth_graph_names_track_the_published_export() {
