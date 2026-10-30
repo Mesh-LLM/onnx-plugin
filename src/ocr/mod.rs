@@ -1,7 +1,9 @@
 //! Native Indra model execution and document assembly.
 
 mod detection;
+pub mod document;
 mod layout;
+mod math;
 mod orientation;
 mod recognition;
 
@@ -17,7 +19,7 @@ use self::layout::{Block, assemble};
 use self::orientation::orient;
 use self::recognition::Recognizers;
 
-const MODEL: &str = "datalab/indra-ocr";
+const MODEL: &str = "datalab-to/indra-ocr@v1.1.0";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Line {
@@ -50,24 +52,44 @@ pub struct Engine {
     order: Option<Session>,
     orientation: Option<Session>,
     det_long_side: usize,
+    math: Option<math::MathReader>,
 }
 
 impl Engine {
     pub fn load(model_dir: &Path) -> Result<Self> {
+        Self::load_with_options(model_dir, 4, false)
+    }
+
+    /// Load the pinned Indra pipeline with a bounded CPU thread count.
+    ///
+    /// Math additionally loads the classifier and cached LaTeX decoder graphs.
+    pub fn load_with_options(model_dir: &Path, threads: usize, math: bool) -> Result<Self> {
+        validate_load_options(threads, math)?;
         let metadata: serde_json::Value = serde_json::from_slice(
             &std::fs::read(model_dir.join("meta.json")).context("read Indra meta.json")?,
         )?;
         let det_long_side = metadata["det_long_side"]
             .as_u64()
             .context("Indra det_long_side missing")? as usize;
-        let detector = session(model_dir.join("det.onnx"))?;
-        let recognizers = Recognizers::load(model_dir, &metadata)?;
+        let math = math
+            .then(|| {
+                let height = metadata["rec_height"]
+                    .as_u64()
+                    .context("Indra rec_height missing")? as usize;
+                math::MathReader::load(model_dir, threads, height)
+            })
+            .transpose()?;
+        let detector = session_with_threads(model_dir.join("det.onnx"), threads)?;
+        let recognizers = Recognizers::load(model_dir, &metadata, threads)?;
         let order = model_dir.join("order.onnx");
-        let order = order.is_file().then(|| session(order)).transpose()?;
+        let order = order
+            .is_file()
+            .then(|| session_with_threads(order, threads))
+            .transpose()?;
         let orientation = model_dir.join("orient.onnx");
         let orientation = orientation
             .is_file()
-            .then(|| session(orientation))
+            .then(|| session_with_threads(orientation, threads))
             .transpose()?;
         Ok(Self {
             detector,
@@ -75,17 +97,32 @@ impl Engine {
             order,
             orientation,
             det_long_side,
+            math,
         })
     }
 
     pub fn recognize_image(&mut self, image: &GrayImage, page_index: usize) -> Result<Page> {
+        self.recognize_image_with_options(image, page_index, false)
+    }
+
+    /// Recognize one image, retaining structural headers/footers in JSON while
+    /// independently controlling their inclusion in Markdown.
+    pub fn recognize_image_with_options(
+        &mut self,
+        image: &GrayImage,
+        page_index: usize,
+        keep_furniture: bool,
+    ) -> Result<Page> {
         if image.width() == 0 || image.height() == 0 {
             bail!("document page is empty");
         }
         let upright = orient(self.orientation.as_mut(), image)?;
         let image = &upright.image;
         let boxes = detect_lines(&mut self.detector, image, self.det_long_side)?;
-        let lines = self.recognizers.recognize_lines(image, &boxes)?;
+        let mut lines = self.recognizers.recognize_lines(image, &boxes)?;
+        if let Some(math) = self.math.as_mut() {
+            math.recognize(image, &mut lines)?;
+        }
         let layout = assemble(self.order.as_mut(), lines, image.width(), image.height())?;
         let lines = layout.lines;
         let text = lines
@@ -97,7 +134,11 @@ impl Engine {
             page_index,
             rotation: upright.rotation,
             vertical: upright.vertical,
-            markdown: layout.markdown,
+            markdown: if keep_furniture {
+                layout::markdown(&layout.blocks, true)
+            } else {
+                layout.markdown
+            },
             text,
             source: "ocr",
             lines,
@@ -121,13 +162,20 @@ impl Engine {
     }
 }
 
-fn session(path: impl AsRef<Path>) -> Result<Session> {
+pub fn validate_load_options(threads: usize, _math: bool) -> Result<()> {
+    if !(1..=256).contains(&threads) {
+        bail!("Indra threads must be between 1 and 256");
+    }
+    Ok(())
+}
+
+fn session_with_threads(path: impl AsRef<Path>, threads: usize) -> Result<Session> {
     let path = path.as_ref();
     if !path.is_file() {
         bail!("Indra model file missing: {}", path.display());
     }
     Ok(Session::builder()?
-        .with_intra_threads(4)
+        .with_intra_threads(threads)
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .with_memory_pattern(false)
         .map_err(|error| anyhow::anyhow!("{error}"))?
@@ -137,6 +185,21 @@ fn session(path: impl AsRef<Path>) -> Result<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_options_fail_before_reading_assets() {
+        let absent = Path::new("/not-an-indra-model");
+        assert!(
+            Engine::load_with_options(absent, 0, false)
+                .err()
+                .expect("invalid threads")
+                .to_string()
+                .contains("threads")
+        );
+        assert!(validate_load_options(4, true).is_ok());
+        assert!(validate_load_options(256, false).is_ok());
+        assert!(validate_load_options(257, false).is_err());
+    }
 
     #[test]
     #[ignore = "requires Indra v1.1.0 model assets"]

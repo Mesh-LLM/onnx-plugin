@@ -85,11 +85,7 @@ pub fn assemble(
         .iter()
         .map(|group| block(group, &lines, &classes))
         .collect::<Vec<_>>();
-    let markdown = blocks
-        .iter()
-        .filter_map(render_markdown)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let markdown = markdown(&blocks, false);
     let ordered_lines = order
         .into_iter()
         .map(|index| lines[index].clone())
@@ -256,8 +252,18 @@ fn block(indices: &[usize], lines: &[Line], classes: &[usize]) -> Block {
     }
 }
 
-fn render_markdown(block: &Block) -> Option<String> {
-    if block.text.is_empty() || matches!(block.label, "Page-Header" | "Page-Footer") {
+pub(super) fn markdown(blocks: &[Block], keep_furniture: bool) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| render_markdown(block, keep_furniture))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_markdown(block: &Block, keep_furniture: bool) -> Option<String> {
+    if block.text.is_empty()
+        || (!keep_furniture && matches!(block.label, "Page-Header" | "Page-Footer"))
+    {
         return None;
     }
     Some(match block.label {
@@ -269,6 +275,30 @@ fn render_markdown(block: &Block) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn furniture_affects_markdown_without_removing_structured_blocks() {
+        let blocks = vec![
+            Block {
+                label: "Page-Header",
+                bbox: [0.0; 4],
+                text: "letterhead".into(),
+            },
+            Block {
+                label: "Text",
+                bbox: [0.0; 4],
+                text: "body".into(),
+            },
+            Block {
+                label: "Page-Footer",
+                bbox: [0.0; 4],
+                text: "page 1".into(),
+            },
+        ];
+        assert_eq!(markdown(&blocks, false), "body");
+        assert_eq!(markdown(&blocks, true), "letterhead\n\nbody\n\npage 1");
+        assert_eq!(blocks.len(), 3);
+    }
 
     #[test]
     fn pairwise_decoder_follows_order_logits() {
