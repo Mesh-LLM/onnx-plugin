@@ -81,7 +81,10 @@ first requests, cross-family concurrency, idle eviction with byte sizes and
 modification times unchanged, loading again in the same provider process,
 startup loading, disk-only prefetch, zero disabling idle eviction, shared failed
 load causes, depth PNG, transcription plain text and body-format precedence,
-400/406 responses, plus scanned/encrypted/hybrid PDF requests through Mesh.
+400/406 responses, plus scanned/encrypted/hybrid PDF requests through Mesh. A
+separate two-node case asserts that a client-only node discovers all four model
+kinds with their workload classes, that discovery wakes no engine, and that each
+kind is then callable from that node.
 
 ## Lifecycle alignment with Mesh #2704
 
@@ -105,14 +108,19 @@ Text-mode PDF extraction intentionally bypasses engine residency.
 ## Recorded state and remaining limits
 
 The macOS arm64 real-weight library suite passes 77 tests with no ignored tests.
-All four live cases pass, including host-owned asset prefetch, fresh offline loading, and FP32 and INT8 through
-two Mesh nodes, against a host built from `1f248d5db443829865a4326fdf8a81b6750a94de`.
+All five live acceptance cases pass, including host-owned asset prefetch, fresh
+offline loading, FP32 and INT8 through two Mesh nodes, and a client-only node
+that discovers all four model kinds in `/api/models` and then calls each of
+them across the mesh. The paired run uses a host built from the merged main
+commit `71a28b5830d81bf83effcf1e08d37377540cf829` (#2704), which the SDK pin
+names too.
 The full-graph checks use `ort` 2.0.0-rc.12 and Rust 1.98.
 
-The matching host/SDK pin above is #2704's reconciliation with the merged
-#2710 (`50fb67dcd27a80941fb3b67abd0ff3254e3e8eb6`). The combined product build
-and real native GGUF cold-load/idle-unload/reload test also pass. Once #2704
-lands, refresh the SDK to its main landing commit and rerun the paired checks.
+A serve node advertises its plugin models in the mesh catalog slightly before it
+claims the host role that makes them callable. Discovery can therefore name a
+model a few seconds before a peer-issued request for it is routable; the live
+harness waits for the serving peer rather than failing on that ordering, and the
+client-side assertions below cover both states.
 
 Follow-up regressions check that Text mode never rasterizes, capped/rotated
 text geometry matches rendering, clipped image bounds do not duplicate an

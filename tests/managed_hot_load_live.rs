@@ -320,3 +320,68 @@ async fn host_asset_service_prefetches_without_sessions_and_reloads_offline() {
         "offline cold load reuses the host-owned cache"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires MESH_ONNX_TEST_HOST, PDFIUM_LIBRARY and all seven pinned model bundles"]
+async fn a_client_discovers_every_model_kind_and_calls_it_across_the_mesh() {
+    let client = client();
+    let config: String = (0..4)
+        .map(|i| model_config(i, false, "on_demand", false, 3))
+        .collect();
+    let mut server = Server::start(&config, None);
+    let provider = server.provider(&client).await;
+    server
+        .wait(&client, &format!("{provider}/v1/models"), |v| {
+            IDS.iter().all(|id| availability(v, id, "loadable"))
+        })
+        .await;
+    let status = server
+        .wait(&client, &format!("{}/api/status", server.control), |v| {
+            v["token"].as_str().is_some()
+        })
+        .await;
+    let token = status["token"].as_str().unwrap();
+    // A second Mesh node with no plugin of its own: everything it reports and
+    // every request it accepts has to cross the peer transport.
+    let mut remote = Server::start("", Some(token));
+    // A serve node advertises its plugin models in the mesh catalog before it
+    // claims the host role that makes them callable, so wait for a peer that
+    // actually accepts inference for all four.
+    remote
+        .wait(&client, &format!("{}/api/status", remote.control), |v| {
+            serving_peer(v, &IDS)
+        })
+        .await;
+    // Discovery first, before a single request has woken an engine: a client
+    // must be able to name each model and the kind of work it does.
+    let inventory = remote
+        .wait(&client, &format!("{}/api/models", remote.control), |v| {
+            discovers_all(v)
+        })
+        .await;
+    for (index, class) in CLASSES.iter().enumerate() {
+        let entry = discovered(&inventory, index);
+        assert_eq!(entry["workload_class"], *class, "{entry}");
+        assert_eq!(entry["name"], IDS[index], "{entry}");
+    }
+    // Naming the models did not wake any of them: the provider still reports
+    // every model as loadable with no session.
+    server
+        .wait(&client, &format!("{provider}/v1/models"), |v| {
+            IDS.iter().all(|id| availability(v, id, "loadable"))
+        })
+        .await;
+    // Each kind is then callable from the same client-only node.
+    for index in 0..4 {
+        infer(&client, &remote.base, index).await;
+    }
+    // Discovery survives the load, still naming all four with their classes.
+    remote
+        .wait(&client, &format!("{}/api/models", remote.control), |v| {
+            discovers_all(v)
+        })
+        .await;
+    remote.assert_alive();
+    server.assert_alive();
+    eprintln!("acceptance passed: four kinds discovered and called from a second node");
+}

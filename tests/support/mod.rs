@@ -13,6 +13,15 @@ pub const IDS: [&str; 4] = [
     "Xenova/clip-vit-base-patch32@6b7c523703ae26e39be4b03774966f8571c7f523",
     "onnx-community/depth-anything-v2-small-ONNX@c3b67641fd837b2368757101311e5d21e511441e",
 ];
+/// The mesh workload class each pinned model advertises, in `IDS` order. A
+/// client needs this to tell an OCR model from a depth model before it knows
+/// anything else about them.
+pub const CLASSES: [&str; 4] = [
+    "document_ocr",
+    "speech_recognition",
+    "image_text_similarity",
+    "depth_estimation",
+];
 pub const PATHS: [&str; 4] = [
     "/mesh/v1/documents/ocr",
     "/v1/audio/transcriptions",
@@ -56,6 +65,45 @@ pub fn model_config(index: usize, int8: bool, load: &str, prefetch: bool, idle: 
         quote(load)
     )
 }
+/// True when a mesh-wide model inventory names every pinned model together with
+/// the workload class that decides which route can call it.
+pub fn discovers_all(value: &Value) -> bool {
+    value["mesh_models"].as_array().is_some_and(|models| {
+        IDS.iter().zip(CLASSES).all(|(id, class)| {
+            models
+                .iter()
+                .any(|model| model["name"] == *id && model["workload_class"] == class)
+        })
+    })
+}
+
+/// True when a client's `/api/status` reports a peer that accepts HTTP inference
+/// and hosts every one of `models`. A peer advertises its models in the mesh
+/// catalog before it claims the host role, so a client that wants to *call* a
+/// model has to wait for this, not merely for the catalog entry.
+pub fn serving_peer(value: &Value, models: &[&str]) -> bool {
+    value["peers"].as_array().is_some_and(|peers| {
+        peers.iter().any(|peer| {
+            peer["role"] == "Host"
+                && models.iter().all(|model| {
+                    peer["hosted_models"].as_array().is_some_and(|hosted| {
+                        hosted.iter().any(|hosted| hosted.as_str() == Some(model))
+                    })
+                })
+        })
+    })
+}
+
+/// The discovered entry for one pinned model, with the class it advertises.
+pub fn discovered(value: &Value, index: usize) -> &Value {
+    value["mesh_models"]
+        .as_array()
+        .expect("mesh model inventory is a list")
+        .iter()
+        .find(|model| model["name"] == IDS[index])
+        .unwrap_or_else(|| panic!("client inventory does not name {}", IDS[index]))
+}
+
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
