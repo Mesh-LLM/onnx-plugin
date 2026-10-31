@@ -11,7 +11,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["multipart", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
-mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "1f248d5db443829865a4326fdf8a81b6750a94de" }
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "71a28b5830d81bf83effcf1e08d37377540cf829" }
 ndarray = "0.17"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
 unicode-normalization = "0.1"
