@@ -70,6 +70,16 @@ pub fn assemble(
     } else {
         ((0..n).collect(), vec![0; n], vec![0.0; n * n])
     };
+    Ok(assemble_ordered(lines, order, classes, same))
+}
+
+fn assemble_ordered(
+    lines: Vec<Line>,
+    order: Vec<usize>,
+    classes: Vec<usize>,
+    same: Vec<f32>,
+) -> Layout {
+    let n = lines.len();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for &index in &order {
         if groups
@@ -85,20 +95,16 @@ pub fn assemble(
         .iter()
         .map(|group| block(group, &lines, &classes))
         .collect::<Vec<_>>();
-    let markdown = blocks
-        .iter()
-        .filter_map(render_markdown)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let markdown = markdown(&blocks, false);
     let ordered_lines = order
         .into_iter()
         .map(|index| lines[index].clone())
         .collect();
-    Ok(Layout {
+    Layout {
         lines: ordered_lines,
         blocks,
         markdown,
-    })
+    }
 }
 
 fn line_features(lines: &[Line], width: f32, height: f32) -> Vec<f32> {
@@ -256,8 +262,18 @@ fn block(indices: &[usize], lines: &[Line], classes: &[usize]) -> Block {
     }
 }
 
-fn render_markdown(block: &Block) -> Option<String> {
-    if block.text.is_empty() || matches!(block.label, "Page-Header" | "Page-Footer") {
+pub(super) fn markdown(blocks: &[Block], keep_furniture: bool) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| render_markdown(block, keep_furniture))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_markdown(block: &Block, keep_furniture: bool) -> Option<String> {
+    if block.text.is_empty()
+        || (!keep_furniture && matches!(block.label, "Page-Header" | "Page-Footer"))
+    {
         return None;
     }
     Some(match block.label {
@@ -269,6 +285,54 @@ fn render_markdown(block: &Block) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn furniture_affects_markdown_without_removing_structured_blocks() {
+        let blocks = vec![
+            Block {
+                label: "Page-Header",
+                bbox: [0.0; 4],
+                text: "letterhead".into(),
+            },
+            Block {
+                label: "Text",
+                bbox: [0.0; 4],
+                text: "body".into(),
+            },
+            Block {
+                label: "Page-Footer",
+                bbox: [0.0; 4],
+                text: "page 1".into(),
+            },
+        ];
+        assert_eq!(markdown(&blocks, false), "body");
+        assert_eq!(markdown(&blocks, true), "letterhead\n\nbody\n\npage 1");
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn assembled_pages_omit_furniture_from_default_markdown_but_keep_structure() {
+        let lines = ["letterhead", "body", "page 1"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| Line {
+                text: text.into(),
+                bbox: [0.0, index as f32 * 20.0, 100.0, index as f32 * 20.0 + 10.0],
+                confidence: 1.0,
+            })
+            .collect();
+        // Class IDs are the OrderNet vocabulary, not preconstructed blocks.
+        let layout = assemble_ordered(lines, vec![0, 1, 2], vec![2, 0, 3], vec![0.0; 9]);
+        assert_eq!(layout.markdown, "body");
+        assert_eq!(layout.lines.len(), 3);
+        assert_eq!(layout.blocks.len(), 3);
+        assert_eq!(layout.blocks[0].label, "Page-Header");
+        assert_eq!(layout.blocks[2].label, "Page-Footer");
+        assert_eq!(
+            markdown(&layout.blocks, true),
+            "letterhead\n\nbody\n\npage 1"
+        );
+    }
 
     #[test]
     fn pairwise_decoder_follows_order_logits() {

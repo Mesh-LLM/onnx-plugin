@@ -7,7 +7,7 @@ use image::{GrayImage, imageops::FilterType};
 use ort::{inputs, session::Session, value::Tensor};
 use unicode_normalization::UnicodeNormalization;
 
-use super::{Line, session};
+use super::{Line, session_with_threads};
 
 const PAD_X: f32 = 0.3;
 const PAD_Y: f32 = 0.2;
@@ -64,11 +64,14 @@ pub struct Recognizers {
 }
 
 impl Recognizers {
-    pub fn load(model_dir: &Path, metadata: &serde_json::Value) -> Result<Self> {
-        let base = session(model_dir.join("rec.onnx"))?;
+    pub fn load(model_dir: &Path, metadata: &serde_json::Value, threads: usize) -> Result<Self> {
+        let base = session_with_threads(model_dir.join("rec.onnx"), threads)?;
         let vocab = Vocab::from_meta(metadata, "vocab")?;
         let script = if model_dir.join("script.onnx").is_file() {
-            Some(session(model_dir.join("script.onnx"))?)
+            Some(session_with_threads(
+                model_dir.join("script.onnx"),
+                threads,
+            )?)
         } else {
             None
         };
@@ -89,7 +92,7 @@ impl Recognizers {
                     groups.insert(
                         name.to_owned(),
                         (
-                            session(path)?,
+                            session_with_threads(path, threads)?,
                             Vocab::from_meta(metadata, &format!("vocab_{name}"))?,
                         ),
                     );
@@ -206,7 +209,7 @@ fn read_line(session: &mut Session, crop: &GrayImage, vocab: &Vocab) -> Result<(
     Ok((text, confidence))
 }
 
-fn line_inputs(crop: &GrayImage) -> Result<(Tensor<f32>, Tensor<i64>)> {
+pub(super) fn line_inputs(crop: &GrayImage) -> Result<(Tensor<f32>, Tensor<i64>)> {
     let width = crop.width() as usize;
     let height = crop.height() as usize;
     let padded_width = width.div_ceil(8) * 8;
@@ -221,7 +224,7 @@ fn line_inputs(crop: &GrayImage) -> Result<(Tensor<f32>, Tensor<i64>)> {
     Ok((image, widths))
 }
 
-fn crop_line(
+pub(super) fn crop_line(
     page: &GrayImage,
     bbox: [f32; 4],
     rec_height: usize,
