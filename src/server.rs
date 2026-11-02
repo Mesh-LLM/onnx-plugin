@@ -8,16 +8,21 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Multipart, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::VARY},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
 use image::GrayImage;
 use pdfium_render::prelude::*;
 use serde_json::json;
 
 use crate::ocr::{Document, Engine};
+
+#[cfg(test)]
+mod http_contract_tests;
+mod representation;
 
 const MODEL: &str = "datalab/indra-ocr";
 const MAX_FILE: usize = 64 * 1024 * 1024;
@@ -71,9 +76,31 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/health", get(health))
-        .route("/v1/documents/ocr", post(ocr))
+        .merge(document_routes(post(ocr), post(legacy_ocr)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
+}
+
+fn document_routes<S: Clone + Send + Sync + 'static>(
+    canonical: MethodRouter<S>,
+    legacy: MethodRouter<S>,
+) -> Router<S> {
+    Router::new()
+        .route("/mesh/v1/documents/ocr", canonical)
+        .route("/v1/documents/ocr", legacy)
+        .route_layer(middleware::from_fn(accept_negotiation))
+}
+
+async fn accept_negotiation(request: Request, next: Next) -> Response {
+    // Reject an unacceptable header before reading multipart data or running OCR.
+    let mut response = match representation::select(request.headers(), None, false) {
+        Ok(_) => next.run(request).await,
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept"));
+    response
 }
 
 async fn models() -> impl IntoResponse {
@@ -87,7 +114,7 @@ async fn health() -> impl IntoResponse {
 struct Upload {
     file: Vec<u8>,
     model: Option<String>,
-    response_format: String,
+    response_format: Option<String>,
     max_pages: usize,
 }
 
@@ -95,7 +122,7 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
     let mut upload = Upload {
         file: Vec::new(),
         model: None,
-        response_format: "json".into(),
+        response_format: None,
         max_pages: 0,
     };
     let mut seen_file = false;
@@ -113,7 +140,7 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
                 upload.model = Some(field.text().await.map_err(ApiError::bad_request)?);
             }
             Some("response_format") => {
-                upload.response_format = field.text().await.map_err(ApiError::bad_request)?;
+                upload.response_format = Some(field.text().await.map_err(ApiError::bad_request)?);
             }
             Some("max_pages") => {
                 upload.max_pages = field
@@ -142,14 +169,6 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
     if upload.model.as_deref().unwrap_or(MODEL) != MODEL {
         return Err(ApiError::bad_request("unsupported OCR model"));
     }
-    if !matches!(
-        upload.response_format.as_str(),
-        "json" | "text" | "markdown"
-    ) {
-        return Err(ApiError::bad_request(
-            "response_format must be json, text, or markdown",
-        ));
-    }
     if upload.max_pages > MAX_PAGES {
         return Err(ApiError::bad_request(
             "max_pages must be between 0 and 1000",
@@ -158,40 +177,36 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
     Ok(upload)
 }
 
-async fn ocr(State(state): State<ServerState>, multipart: Multipart) -> Result<Response, ApiError> {
+async fn ocr(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    recognize_upload(state, headers, multipart, false).await
+}
+
+async fn legacy_ocr(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    recognize_upload(state, headers, multipart, true).await
+}
+
+async fn recognize_upload(
+    state: ServerState,
+    headers: HeaderMap,
+    multipart: Multipart,
+    legacy: bool,
+) -> Result<Response, ApiError> {
     let upload = read_upload(multipart).await?;
-    let response_format = upload.response_format.clone();
+    let representation =
+        representation::select(&headers, upload.response_format.as_deref(), legacy)?;
     let document = tokio::task::spawn_blocking(move || process_upload(&state, upload))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::processing)?;
-    let joined = |markdown: bool| {
-        document
-            .pages
-            .iter()
-            .map(|page| {
-                if markdown {
-                    page.markdown.as_str()
-                } else {
-                    page.text.as_str()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    Ok(match response_format.as_str() {
-        "text" => (
-            [("content-type", "text/plain; charset=utf-8")],
-            joined(false),
-        )
-            .into_response(),
-        "markdown" => (
-            [("content-type", "text/markdown; charset=utf-8")],
-            joined(true),
-        )
-            .into_response(),
-        _ => Json(document).into_response(),
-    })
+    Ok(representation.render(document))
 }
 
 fn process_upload(state: &ServerState, upload: Upload) -> Result<Document> {
@@ -269,6 +284,7 @@ fn page_limit(max_pages: usize) -> usize {
     }
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -494,7 +510,7 @@ mod tests {
                     .file_name(file),
             );
             let response = reqwest::Client::new()
-                .post(format!("http://{address}/v1/documents/ocr"))
+                .post(format!("http://{address}/mesh/v1/documents/ocr"))
                 .multipart(form)
                 .send()
                 .await
