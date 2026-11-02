@@ -55,6 +55,33 @@ async fn both_routes_reject_unacceptable_headers_before_multipart_or_recognition
 }
 
 #[tokio::test]
+async fn both_routes_admit_acceptable_headers() {
+    async fn admitted() -> &'static str {
+        "admitted"
+    }
+
+    let app = document_routes(post(admitted), post(admitted));
+    let (address, _server) = serve(app).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for route in ["/mesh/v1/documents/ocr", "/v1/documents/ocr"] {
+        let response = client
+            .post(format!("http://{address}{route}"))
+            .header("Accept", "application/json")
+            .body("not multipart")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["vary"], "Accept");
+        assert_eq!(response.text().await.unwrap(), "admitted");
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires Indra v1.1.0 model assets and ONNX Runtime"]
 async fn native_image_negotiates_formats_and_preserves_legacy_precedence() {
     let model_dir = std::env::var("ONNX_OCR_MODEL_DIR").expect("ONNX_OCR_MODEL_DIR");

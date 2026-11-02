@@ -128,8 +128,16 @@ impl<'a> MediaRange<'a> {
             } else if !weighted {
                 // Every emitted representation is UTF-8. Other media parameters
                 // are unsupported; extensions after q do not constrain the type.
+                let value = value.trim();
+                let unquoted = value
+                    .strip_prefix('"')
+                    .and_then(|inner| inner.strip_suffix('"'))
+                    .unwrap_or(value);
+                if name.trim().eq_ignore_ascii_case("charset") && unquoted.contains('"') {
+                    return Err(not_acceptable());
+                }
                 range.supported_parameters &= name.trim().eq_ignore_ascii_case("charset")
-                    && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8");
+                    && unquoted.eq_ignore_ascii_case("utf-8");
                 // Only charset is supported, and duplicate parameters are invalid.
                 range.supported_parameters &= range.parameter_count == 0;
                 range.parameter_count = 1;

@@ -75,6 +75,7 @@ fn weighted_ranges_respect_specific_exclusions_and_server_ties() {
         ("text/*;q=0.8, text/plain;q=0", Representation::Markdown),
         ("text/plain, application/json", Representation::Json),
         ("TEXT/PLAIN; charset=\"UTF-8\"", Representation::Text),
+        ("text/plain;charset=latin-1,*/*", Representation::Json),
         (
             "text/plain;q=1;note=\"comma, semicolon; and \\\"quote\\\"\"",
             Representation::Text,
@@ -106,6 +107,8 @@ fn unacceptable_or_malformed_accept_cannot_fall_back_to_json() {
         "*/*;q=0",
         "application/json;q=0, text/*;q=0",
         "text/plain;charset=latin-1",
+        "text/plain;charset=\"\"utf-8\"\"",
+        "text/plain;charset=\"\"utf-8\"\",*/*",
         "text/plain;q=NaN",
         "text/plain;q=1.1",
         "text/plain;q=-1",
