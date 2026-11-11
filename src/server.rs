@@ -10,10 +10,11 @@ use crate::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::VARY},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
 use serde_json::{Value, json};
 use std::{
@@ -41,12 +42,55 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
-        .route("/mesh/v1/documents/ocr", post(ocr))
+        .merge(document_routes(post(ocr), post(legacy_ocr)))
         .route("/v1/audio/transcriptions", post(transcription))
         .route("/mesh/v1/images/similarity", post(similarity))
         .route("/mesh/v1/images/depth", post(depth))
         .layer(DefaultBodyLimit::max(MAX_FILE + 64 * 1024))
         .with_state(state)
+}
+
+/// The canonical Mesh task route and the legacy direct-provider alias share
+/// one OCR handler, gated so an unacceptable `Accept` header is rejected
+/// before multipart data is read. On the legacy path only, and only when
+/// `Accept` is absent, the multipart `response_format` names the body.
+fn document_routes<S: Clone + Send + Sync + 'static>(
+    canonical: MethodRouter<S>,
+    legacy: MethodRouter<S>,
+) -> Router<S> {
+    Router::new()
+        .route("/mesh/v1/documents/ocr", canonical)
+        .route("/v1/documents/ocr", legacy)
+        .route_layer(middleware::from_fn(accept_negotiation))
+}
+
+async fn accept_negotiation(request: Request, next: Next) -> Response {
+    let mut response = match preflight_accept(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept"));
+    response
+}
+
+fn preflight_accept(headers: &HeaderMap) -> std::result::Result<(), ApiError> {
+    const OCR_REPRESENTATIONS: &[Representation] = &[
+        Representation::Json,
+        Representation::Text,
+        Representation::Markdown,
+    ];
+    let accept = headers
+        .get_all("accept")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(ApiError::bad_request)?
+        .join(",");
+    Representation::negotiate(Some(&accept), OCR_REPRESENTATIONS)
+        .map(|_| ())
+        .map_err(|error| ApiError::new(StatusCode::NOT_ACCEPTABLE, error))
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
@@ -120,28 +164,35 @@ async fn ocr(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
-    task(state, headers, multipart, Kind::Indra).await
+    task(state, headers, multipart, Kind::Indra, false).await
+}
+async fn legacy_ocr(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    task(state, headers, multipart, Kind::Indra, true).await
 }
 async fn transcription(
     State(state): State<ServerState>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
-    task(state, headers, multipart, Kind::Whisper).await
+    task(state, headers, multipart, Kind::Whisper, false).await
 }
 async fn similarity(
     State(state): State<ServerState>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
-    task(state, headers, multipart, Kind::Clip).await
+    task(state, headers, multipart, Kind::Clip, false).await
 }
 async fn depth(
     State(state): State<ServerState>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
-    task(state, headers, multipart, Kind::Depth).await
+    task(state, headers, multipart, Kind::Depth, false).await
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -156,6 +207,7 @@ async fn task(
     headers: HeaderMap,
     multipart: Multipart,
     kind: Kind,
+    legacy: bool,
 ) -> Result<Response, ApiError> {
     let _upload_permit = UPLOAD_PERMITS
         .try_acquire()
@@ -181,13 +233,34 @@ async fn task(
     let mut upload = tokio::time::timeout_at(deadline, read_upload(multipart))
         .await
         .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "upload deadline exceeded"))??;
-    // OpenAI's body field takes precedence even over an unacceptable Accept.
-    // Remove it before validating the task's own options.
     drop(_upload_permit);
+    // OpenAI-shaped surfaces name the body in the form. On the OpenAI
+    // transcription route the field wins outright; on the legacy OCR alias it
+    // applies only when `Accept` is absent, and any supplied `Accept` —
+    // including `*/*` — overrides it. Remove it before validating the task's
+    // own options so the alias does not leak the field into OCR defaults.
+    let body_format = if kind == Kind::Whisper || legacy {
+        upload.fields.remove("response_format")
+    } else {
+        None
+    };
     let format = if kind == Kind::Whisper
-        && let Some(requested) = upload.fields.remove("response_format")
+        && let Some(requested) = body_format.as_deref()
     {
-        Representation::from_openai_response_format(&requested).map_err(ApiError::bad_request)?
+        Representation::from_openai_response_format(requested).map_err(ApiError::bad_request)?
+    } else if accept.trim().is_empty()
+        && let Some(requested) = body_format.as_deref()
+    {
+        match requested.trim().to_ascii_lowercase().as_str() {
+            "json" => Representation::Json,
+            "text" => Representation::Text,
+            "markdown" => Representation::Markdown,
+            _ => {
+                return Err(ApiError::bad_request(
+                    "response_format must be json, text, or markdown",
+                ));
+            }
+        }
     } else {
         Representation::negotiate(Some(&accept), supported)
             .map_err(|error| ApiError::new(StatusCode::NOT_ACCEPTABLE, error))?
@@ -662,6 +735,64 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "the second header permits JSON, then assets are unavailable"
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_ocr_alias_honors_response_format_only_without_accept() {
+        // The legacy direct-provider alias keeps serving older clients: with no
+        // `Accept` header the multipart `response_format` names the body, any
+        // supplied `Accept` overrides the field, and the canonical task route
+        // keeps rejecting the field outright.
+        let (url, task) = server().await;
+        let client = reqwest::Client::new();
+        let form = |format: Option<&str>| {
+            let mut form = reqwest::multipart::Form::new()
+                .text(
+                    "model",
+                    "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
+                )
+                .part("file", reqwest::multipart::Part::bytes(tiny_png()));
+            if let Some(format) = format {
+                form = form.text("response_format", format.to_string());
+            }
+            form
+        };
+        for (accept, format, expected) in [
+            // No preference: the legacy field selects the representation and
+            // the unloaded model stops the request past negotiation.
+            ("", Some("text"), StatusCode::SERVICE_UNAVAILABLE),
+            // Any supplied Accept overrides the field, even `*/*`, and an
+            // invalid field value is ignored rather than faulted.
+            ("*/*", Some("invalid"), StatusCode::SERVICE_UNAVAILABLE),
+            // An unacceptable Accept never falls back to the field.
+            ("image/png", Some("text"), StatusCode::NOT_ACCEPTABLE),
+        ] {
+            let mut request = client
+                .post(format!("{url}/v1/documents/ocr"))
+                .multipart(form(format));
+            if !accept.is_empty() {
+                request = request.header("Accept", accept);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), expected, "accept={accept:?}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("vary")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Accept")
+            );
+        }
+        // The canonical task route rejects the field instead of ignoring it.
+        let response = client
+            .post(format!("{url}/mesh/v1/documents/ocr"))
+            .header("Accept", "application/json")
+            .multipart(form(Some("text")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         task.abort();
     }
 
