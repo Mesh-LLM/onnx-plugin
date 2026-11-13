@@ -73,7 +73,21 @@ pub fn validate_defaults(
     if value.get("password").is_some() || value.get("labels").is_some() {
         bail!("password and labels are request-only inputs, not defaults");
     }
+    reject_pages_and_max_pages(kind, &value)?;
     decode(kind, value, false).map(|_| ())
+}
+
+/// `pages` and `max_pages` select two different ways and never combine; the
+/// check runs on the merged map so a default on one side cannot slip past a
+/// field on the other.
+fn reject_pages_and_max_pages(kind: Kind, value: &Value) -> Result<()> {
+    if kind == Kind::Indra && value.get("pages").is_some() && value.get("max_pages").is_some() {
+        bail!(
+            "`pages` selects a page range and `max_pages` caps the page count; \
+             they are mutually exclusive — use `pages` to select (for example 1-10) or `max_pages` to cap"
+        );
+    }
+    Ok(())
 }
 
 pub fn merge(
@@ -81,12 +95,6 @@ pub fn merge(
     defaults: &BTreeMap<String, impl serde::Serialize>,
     fields: BTreeMap<String, String>,
 ) -> Result<RequestOptions> {
-    if kind == Kind::Indra && fields.contains_key("pages") && fields.contains_key("max_pages") {
-        bail!(
-            "`pages` selects a page range and `max_pages` caps the page count; \
-             they are mutually exclusive — use `pages` to select (for example 1-10) or `max_pages` to cap"
-        );
-    }
     let mut values: Map<String, Value> = serde_json::from_value(serde_json::to_value(defaults)?)?;
     for (key, value) in fields {
         let parsed = match key.as_str() {
@@ -97,7 +105,9 @@ pub fn merge(
         };
         values.insert(key, parsed);
     }
-    decode(kind, Value::Object(values), true)
+    let value = Value::Object(values);
+    reject_pages_and_max_pages(kind, &value)?;
+    decode(kind, value, true)
 }
 
 /// Per-request acquisition + inference budget when the caller does not name
@@ -281,6 +291,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pages_and_max_pages_stay_exclusive_across_defaults_and_requests() {
+        // The check runs on the merged map: a default setting one side and a
+        // request field setting the other still lands on both keys.
+        for (defaults, fields) in [
+            (
+                BTreeMap::from([("pages".to_string(), Value::from("1-10"))]),
+                BTreeMap::from([("max_pages".to_string(), "5".to_string())]),
+            ),
+            (
+                BTreeMap::from([("max_pages".to_string(), Value::from(5))]),
+                BTreeMap::from([("pages".to_string(), "1-10".to_string())]),
+            ),
+        ] {
+            let error = merge(Kind::Indra, &defaults, fields)
+                .err()
+                .expect("mutually exclusive across defaults and request");
+            assert!(error.to_string().contains("mutually exclusive"), "{error}");
+        }
+        // Defaults alone must not set both either.
+        let error = validate_defaults(
+            Kind::Indra,
+            &BTreeMap::from([
+                ("pages".to_string(), Value::from("1-10")),
+                ("max_pages".to_string(), Value::from(5)),
+            ]),
+        )
+        .expect_err("defaults setting both is rejected");
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
     }
 
     #[test]

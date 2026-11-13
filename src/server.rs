@@ -23,7 +23,7 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Write},
+    io::Cursor,
     path::PathBuf,
     sync::{
         Arc,
@@ -31,6 +31,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// Default upload cap, replaced by `ONNX_MAX_BYTES` / `--max-bytes`.
@@ -177,13 +178,28 @@ struct Upload {
     fields: BTreeMap<String, String>,
 }
 
+/// Multipart failures raised by the body limit keep their 413 status and
+/// name the configured cap; every other multipart error is a 400.
+fn multipart_error(error: axum::extract::multipart::MultipartError, max_bytes: usize) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "upload exceeds the limit of {} (ONNX_MAX_BYTES)",
+                human_bytes(max_bytes)
+            ),
+        );
+    }
+    ApiError::bad_request(error)
+}
+
 async fn read_upload(mut multipart: Multipart, max_bytes: usize) -> Result<Upload, ApiError> {
     let mut file = None;
     let mut fields = BTreeMap::new();
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(ApiError::bad_request)?
+        .map_err(|error| multipart_error(error, max_bytes))?
     {
         let name = field
             .name()
@@ -193,12 +209,24 @@ async fn read_upload(mut multipart: Multipart, max_bytes: usize) -> Result<Uploa
             if file.is_some() {
                 return Err(ApiError::bad_request("duplicate file field"));
             }
-            let mut temp = tempfile::Builder::new()
-                .prefix("mesh-onnx-")
-                .tempfile()
-                .map_err(ApiError::internal)?;
+            // Creating the spool file is blocking I/O; the writes below go
+            // through tokio's async file. The NamedTempFile stays alive for
+            // the whole read so the spool is deleted on success, error and
+            // drop alike.
+            let temp = tokio::task::spawn_blocking(|| {
+                tempfile::Builder::new().prefix("mesh-onnx-").tempfile()
+            })
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+            let mut writer =
+                tokio::fs::File::from_std(temp.as_file().try_clone().map_err(ApiError::internal)?);
             let mut size: u64 = 0;
-            while let Some(chunk) = field.chunk().await.map_err(ApiError::bad_request)? {
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|error| multipart_error(error, max_bytes))?
+            {
                 size = size.saturating_add(chunk.len() as u64);
                 if size > max_bytes as u64 {
                     return Err(ApiError::new(
@@ -209,8 +237,11 @@ async fn read_upload(mut multipart: Multipart, max_bytes: usize) -> Result<Uploa
                         ),
                     ));
                 }
-                temp.write_all(&chunk).map_err(ApiError::internal)?;
+                writer.write_all(&chunk).await.map_err(ApiError::internal)?;
             }
+            writer.flush().await.map_err(ApiError::internal)?;
+            // The clone closes; the NamedTempFile owns the path from here.
+            drop(writer);
             if size == 0 {
                 return Err(ApiError::bad_request("file must contain at least 1 byte"));
             }
@@ -222,7 +253,11 @@ async fn read_upload(mut multipart: Multipart, max_bytes: usize) -> Result<Uploa
                 ));
             }
             let mut value = Vec::new();
-            while let Some(chunk) = field.chunk().await.map_err(ApiError::bad_request)? {
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|error| multipart_error(error, max_bytes))?
+            {
                 if value.len().saturating_add(chunk.len()) > 64 * 1024 {
                     return Err(ApiError::bad_request("multipart control exceeds 64 KiB"));
                 }
@@ -392,8 +427,17 @@ async fn task(
     }
     let options = requests::merge(kind, &model.config.request_defaults, fields)
         .map_err(ApiError::bad_request)?;
-    if let RequestOptions::Ocr(options) = options {
-        return ocr_task(state, model, upload, options, format).await;
+    if let RequestOptions::Ocr(mut options) = options {
+        if legacy {
+            // The alias serves v0.1 clients: v0.2-only options never apply
+            // there, even when `request_defaults` sets them. Without this a
+            // default could turn a legacy request into metadata or NDJSON.
+            options.pages = None;
+            options.pages_only = false;
+            options.stream = false;
+            options.deadline_secs = None;
+        }
+        return ocr_task(state, model, upload, options, format, legacy, flat_deadline).await;
     }
     // Whisper, CLIP and Depth keep the v0.1 semantics: a flat 120-second
     // budget from the start of the request.
@@ -474,6 +518,8 @@ async fn ocr_task(
     upload: Upload,
     options: PdfOptions,
     format: Representation,
+    legacy: bool,
+    flat_deadline: tokio::time::Instant,
 ) -> Result<Response, ApiError> {
     let permit = state
         .limits
@@ -519,16 +565,26 @@ async fn ocr_task(
         Some(range) => range.selected_len(metadata.pages),
         None => metadata.pages.min(options.max_pages),
     };
-    let budget = options
-        .deadline_secs
-        .unwrap_or_else(|| requests::default_deadline_secs(selected));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget);
+    // The alias serves v0.1 clients: their contract is the flat 120-second
+    // budget, whatever the page-scaled default says.
+    let budget = if legacy {
+        FLAT_DEADLINE_SECS
+    } else {
+        options
+            .deadline_secs
+            .unwrap_or_else(|| requests::default_deadline_secs(selected))
+    };
+    let deadline = if legacy {
+        flat_deadline
+    } else {
+        tokio::time::Instant::now() + Duration::from_secs(budget)
+    };
     if format == Representation::NdJson || options.stream {
         return ocr_stream(state, model, upload, options, budget, metadata.pages).await;
     }
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancellation = cancel.0.clone();
-    let result = tokio::time::timeout_at(deadline, async move {
+    let mut result = tokio::time::timeout_at(deadline, async move {
         if options.mode == crate::ocr::document::OcrMode::Text {
             let text_permit = state
                 .limits
@@ -588,6 +644,15 @@ async fn ocr_task(
     })
     .await
     .map_err(|_| deadline_exceeded(budget))??;
+    // The alias serves v0.1 clients: their JSON keeps the exact shape they
+    // decoded before, without the v0.2 response bounds.
+    if legacy
+        && let Payload::Value(value) = &mut result
+        && let Some(map) = value.as_object_mut()
+    {
+        map.remove("page_from");
+        map.remove("page_to");
+    }
     response(result, format)
 }
 

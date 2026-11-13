@@ -243,7 +243,7 @@ impl DocumentSource {
 
     /// Cheap structural check so corrupt uploads fail before Pdfium is asked
     /// to interpret them (a valid envelope that still cannot be opened is
-    /// treated as encrypted in `open_document`).
+    /// diagnosed from Pdfium's error in `open_document`).
     fn validate_pdf_envelope(&self) -> Result<()> {
         let tail = match self {
             #[cfg(test)]
@@ -500,9 +500,9 @@ fn open_document<'a>(
     source: &DocumentSource,
     options: &PdfOptions,
 ) -> Result<PdfDocument<'a>> {
-    // Never include the password or uploaded bytes in error context. A
-    // well-formed PDF that still will not open has practically always been
-    // encrypted; name the remedy so pages_only can answer 401.
+    // Never include the password or uploaded bytes in error context. Only
+    // encryption failures ask for `password`; a structurally valid envelope
+    // that Pdfium still cannot parse is corrupt input, not a locked document.
     let result = match source {
         #[cfg(test)]
         DocumentSource::Memory(data) => {
@@ -510,12 +510,11 @@ fn open_document<'a>(
         }
         DocumentSource::Path(path) => pdfium.load_pdf_from_file(path, options.password.as_deref()),
     };
-    result.map_err(|error| {
-        if options.password.is_none() {
-            PasswordRequired.into()
-        } else {
-            invalid(format!("open uploaded PDF: {error}"))
-        }
+    result.map_err(|error| match error {
+        PdfiumError::PdfiumLibraryInternalError(
+            PdfiumInternalError::PasswordError | PdfiumInternalError::SecurityError,
+        ) if options.password.is_none() => PasswordRequired.into(),
+        error => invalid(format!("open uploaded PDF: {error}")),
     })
 }
 
