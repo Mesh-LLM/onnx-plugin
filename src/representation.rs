@@ -7,6 +7,7 @@ pub enum Representation {
     Json,
     Text,
     Markdown,
+    NdJson,
     Png,
 }
 
@@ -16,6 +17,7 @@ impl Representation {
             Self::Json => "application/json",
             Self::Text => "text/plain; charset=utf-8",
             Self::Markdown => "text/markdown; charset=utf-8",
+            Self::NdJson => "application/x-ndjson",
             Self::Png => "image/png",
         }
     }

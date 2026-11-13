@@ -65,6 +65,11 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
+      - name: Prepare Windows DLL output directories
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force target/release/build/examples, target/release/build/deps | Out-Null
+
       - name: Build release binary
         run: cargo build --release --locked
 
@@ -97,6 +102,11 @@ jobs:
           $versionedArchive = "mesh-onnx-$version-${{ matrix.target }}.${{ matrix.archive_ext }}"
           New-Item -ItemType Directory -Force -Path dist/mesh-onnx | Out-Null
           Copy-Item "target/release/${{ matrix.binary }}" "dist/mesh-onnx/mesh-onnx.exe"
+          $dlls = @(Get-ChildItem target/release/build/*.dll, target/release/*.dll -ErrorAction SilentlyContinue)
+          if (-not ($dlls | Where-Object { $_.Name -eq 'DirectML.dll' })) { throw 'DirectML.dll was not produced by ort-sys' }
+          $dlls | Copy-Item -Destination dist/mesh-onnx -Force
+          & dist/mesh-onnx/mesh-onnx.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable failed: $LASTEXITCODE" }
           Copy-Item plugin.toml "dist/mesh-onnx/plugin.toml"
           Copy-Item README.md "dist/mesh-onnx/README.md"
           Copy-Item docs "dist/mesh-onnx/docs" -Recurse

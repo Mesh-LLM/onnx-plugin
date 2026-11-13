@@ -1,7 +1,8 @@
 //! Bounded document decoding, PDF text extraction, and raster OCR.
 
 use std::{
-    path::Path,
+    io::{Read, Seek},
+    path::{Path, PathBuf},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -61,8 +62,102 @@ pub struct PdfOptions {
     pub image_ocr: bool,
     pub keep_furniture: bool,
     pub max_pages: usize,
+    /// 1-based inclusive selection (`3`, `1-10`, `1-`); mutually exclusive
+    /// with `max_pages`, which caps instead of selecting.
+    pub pages: Option<PageRange>,
+    /// Decoding-only metadata response: page count and rendered page sizes.
+    pub pages_only: bool,
+    /// Select NDJSON streaming on the canonical OCR route.
+    pub stream: bool,
+    /// Per-request acquisition + inference budget in seconds.
+    pub deadline_secs: Option<u64>,
     #[serde(skip_serializing)]
     pub password: Option<String>,
+}
+
+/// 1-based inclusive page selection: `3` is one page, `1-10` a closed range,
+/// `1-` runs to the end of the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageRange {
+    pub from: usize,
+    pub to: Option<usize>,
+}
+
+impl PageRange {
+    pub fn parse(input: &str) -> Result<Self> {
+        let value = input.trim();
+        let syntax =
+            "expected a page number ('3'), an inclusive range ('1-10'), or an open range ('1-')";
+        let invalid = || anyhow::anyhow!("invalid `pages` value '{input}': {syntax}");
+        if value.is_empty() {
+            return Err(invalid());
+        }
+        let parse_page = |text: &str| -> Result<usize> {
+            let page: usize = text.trim().parse().map_err(|_| invalid())?;
+            if page == 0 {
+                bail!("invalid `pages` value '{input}': page numbers start at 1");
+            }
+            Ok(page)
+        };
+        match value.split_once('-') {
+            None => {
+                let from = parse_page(value)?;
+                Ok(Self {
+                    from,
+                    to: Some(from),
+                })
+            }
+            Some((start, "")) => Ok(Self {
+                from: parse_page(start)?,
+                to: None,
+            }),
+            Some((start, end)) => {
+                let from = parse_page(start)?;
+                let to = parse_page(end)?;
+                if to < from {
+                    bail!("invalid `pages` value '{input}': range end precedes its start");
+                }
+                Ok(Self { from, to: Some(to) })
+            }
+        }
+    }
+
+    /// Pages this selection covers in a document with `page_count` pages.
+    /// Call [`Self::validate_against`] first.
+    pub fn selected_len(&self, page_count: usize) -> usize {
+        self.to.unwrap_or(page_count) - self.from + 1
+    }
+
+    pub fn validate_against(&self, page_count: usize) -> Result<()> {
+        let to = self.to.unwrap_or(page_count);
+        if self.from > page_count || to > page_count {
+            bail!("document has {page_count} pages; pages {self} is out of range");
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for PageRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.to {
+            Some(to) if to == self.from => write!(formatter, "{}", self.from),
+            Some(to) => write!(formatter, "{}-{}", self.from, to),
+            None => write!(formatter, "{}-", self.from),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PageRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for PageRange {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 impl Default for PdfOptions {
@@ -73,6 +168,10 @@ impl Default for PdfOptions {
             image_ocr: true,
             keep_furniture: false,
             max_pages: MAX_PAGES,
+            pages: None,
+            pages_only: false,
+            stream: false,
+            deadline_secs: None,
             password: None,
         }
     }
@@ -86,6 +185,11 @@ impl PdfOptions {
         }
         if !(1..=MAX_PAGES).contains(&self.max_pages) {
             bail!("max_pages must be between 1 and 1000");
+        }
+        if let Some(deadline) = self.deadline_secs
+            && !(30..=900).contains(&deadline)
+        {
+            bail!("deadline_secs must be between 30 and 900; {deadline} was requested");
         }
         if self
             .password
@@ -109,54 +213,253 @@ pub fn process(
     process_cancellable(data, library, options, engine, &AtomicBool::new(false))
 }
 
-/// Validate cheap document properties before acquiring a model lease.
-/// PDF parsing and password checks remain Pdfium's responsibility during processing.
-pub fn validate_input(data: &[u8], options: &PdfOptions) -> Result<()> {
-    options.validate().map_err(invalid)?;
-    if data.starts_with(b"%PDF-") {
-        if data.len() < 20 || !data.windows(5).any(|window| window == b"%%EOF") {
-            return Err(invalid("invalid or truncated PDF upload"));
-        }
-    } else {
-        if options.mode == OcrMode::Text {
-            return Err(invalid("text mode requires a PDF text layer"));
-        }
-        decode_image(data)?;
-    }
-    Ok(())
+/// Where document bytes come from. Spooled uploads stay on disk: Pdfium reads
+/// PDFs from a path and image decoders take any reader, so the plugin only
+/// buffers a document when a caller hands it bytes directly.
+pub enum DocumentSource {
+    /// Byte-vector entry point used by tests; the server always spools to a path.
+    #[cfg(test)]
+    Memory(Vec<u8>),
+    Path(PathBuf),
 }
 
-/// Process a document with cancellation checkpoints between pages and image regions.
+impl DocumentSource {
+    fn is_pdf(&self) -> Result<bool> {
+        const MAGIC: &[u8; 5] = b"%PDF-";
+        match self {
+            #[cfg(test)]
+            Self::Memory(data) => Ok(data.starts_with(MAGIC)),
+            Self::Path(path) => {
+                let mut file = std::fs::File::open(path)
+                    .with_context(|| format!("open {}", path.display()))?;
+                let mut head = [0u8; 5];
+                let read = file
+                    .read(&mut head)
+                    .with_context(|| format!("read {}", path.display()))?;
+                Ok(head[..read] == *MAGIC)
+            }
+        }
+    }
+
+    /// Cheap structural check so corrupt uploads fail before Pdfium is asked
+    /// to interpret them (a valid envelope that still cannot be opened is
+    /// diagnosed from Pdfium's error in `open_document`).
+    fn validate_pdf_envelope(&self) -> Result<()> {
+        let tail = match self {
+            #[cfg(test)]
+            Self::Memory(data) => data.clone(),
+            Self::Path(path) => {
+                let mut file = std::fs::File::open(path)
+                    .with_context(|| format!("open {}", path.display()))?;
+                let length = file
+                    .metadata()
+                    .with_context(|| format!("stat {}", path.display()))?
+                    .len();
+                if length < 20 {
+                    return Err(invalid("invalid or truncated PDF upload"));
+                }
+                file.seek(std::io::SeekFrom::End(-1024.min(length as i64)))
+                    .context("seek uploaded PDF")?;
+                let mut tail = Vec::new();
+                file.read_to_end(&mut tail)
+                    .context("read uploaded PDF tail")?;
+                tail
+            }
+        };
+        if tail.len() < 20 || !tail.windows(5).any(|window| window == b"%%EOF") {
+            return Err(invalid("invalid or truncated PDF upload"));
+        }
+        Ok(())
+    }
+}
+
+/// Marker for an encrypted PDF offered without its password. The OCR route
+/// maps this to 401 so callers can tell "supply `password`" apart from corrupt.
+#[derive(Debug)]
+pub struct PasswordRequired;
+
+impl std::fmt::Display for PasswordRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("encrypted PDF requires the `password` multipart field")
+    }
+}
+
+impl std::error::Error for PasswordRequired {}
+
+/// Decoding-only document facts. Runs without an engine, so metadata answers
+/// work on a cold model and never enter model admission.
+#[derive(Debug, Serialize)]
+pub struct PageSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug)]
+pub struct DocumentMetadata {
+    pub pages: usize,
+    pub page_sizes: Vec<PageSize>,
+}
+
+/// Decode a PDF or supported image and report page count and rendered sizes.
+/// For PDFs, sizes are at the requested DPI; an image yields one entry.
+pub fn inspect_document(
+    source: &DocumentSource,
+    library: Option<&Path>,
+    options: &PdfOptions,
+) -> Result<DocumentMetadata> {
+    options.validate().map_err(invalid)?;
+    if source.is_pdf()? {
+        source.validate_pdf_envelope()?;
+        let pdfium = bind_pdfium(library)?;
+        let document = open_document(&pdfium, source, options)?;
+        let mut page_sizes = Vec::new();
+        for page in document.pages().iter() {
+            let (width, height) = page_dimensions(&page, options.dpi)?;
+            page_sizes.push(PageSize { width, height });
+        }
+        return Ok(DocumentMetadata {
+            pages: page_sizes.len(),
+            page_sizes,
+        });
+    }
+    if options.mode == OcrMode::Text {
+        return Err(invalid("text mode requires a PDF text layer"));
+    }
+    let image = match source {
+        #[cfg(test)]
+        DocumentSource::Memory(data) => decode_image(data)?,
+        DocumentSource::Path(path) => decode_image_file(path)?,
+    };
+    Ok(DocumentMetadata {
+        pages: 1,
+        page_sizes: vec![PageSize {
+            width: image.width(),
+            height: image.height(),
+        }],
+    })
+}
+
+/// Process a document with cancellation checkpoints between pages and image
+/// regions. Byte-vector entry point for tests; the server uses the file-based
+/// variants so uploads stay spooled on disk.
+#[cfg(test)]
 pub fn process_cancellable(
     data: &[u8],
     library: Option<&Path>,
     options: &PdfOptions,
-    mut engine: Option<&mut Engine>,
+    engine: Option<&mut Engine>,
     cancel: &AtomicBool,
 ) -> Result<Document> {
-    options.validate().map_err(invalid)?;
-    check_cancelled(cancel)?;
-    let pages = if data.starts_with(b"%PDF-") {
-        process_pdf(data, library, options, &mut engine, cancel)?
-    } else {
-        if options.mode == OcrMode::Text {
-            return Err(invalid("text mode requires a PDF text layer"));
-        }
-        let image = decode_image(data)?;
-        vec![required_engine(&mut engine)?.recognize_image_with_options(
-            &image,
-            0,
-            options.keep_furniture,
-        )?]
-    };
-    Ok(Document {
-        model: "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
-        pages,
-    })
+    let mut pages = Vec::new();
+    process_source(
+        &DocumentSource::Memory(data.to_vec()),
+        library,
+        options,
+        engine,
+        cancel,
+        &mut |page| {
+            pages.push(page);
+            Ok(())
+        },
+    )?;
+    Ok(document_from_pages(pages))
 }
 
+/// Aggregate processing of an on-disk upload (the server's non-streaming path).
+pub fn process_cancellable_file(
+    path: &Path,
+    library: Option<&Path>,
+    options: &PdfOptions,
+    engine: Option<&mut Engine>,
+    cancel: &AtomicBool,
+) -> Result<Document> {
+    let mut pages = Vec::new();
+    process_source(
+        &DocumentSource::Path(path.to_path_buf()),
+        library,
+        options,
+        engine,
+        cancel,
+        &mut |page| {
+            pages.push(page);
+            Ok(())
+        },
+    )?;
+    Ok(document_from_pages(pages))
+}
+
+/// Streaming processing of an on-disk upload: each completed page is handed
+/// to the sink in page order, so peak memory stays O(one page) either way.
+pub fn process_cancellable_streaming(
+    path: &Path,
+    library: Option<&Path>,
+    options: &PdfOptions,
+    engine: Option<&mut Engine>,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Page) -> Result<()>,
+) -> Result<()> {
+    process_source(
+        &DocumentSource::Path(path.to_path_buf()),
+        library,
+        options,
+        engine,
+        cancel,
+        sink,
+    )
+}
+
+fn document_from_pages(pages: Vec<Page>) -> Document {
+    // 1-based inclusive bounds let chunked callers reassemble page ranges.
+    let page_from = pages.first().map_or(1, |page| page.page_index + 1);
+    let page_to = pages.last().map_or(0, |page| page.page_index + 1);
+    Document {
+        model: "datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b",
+        pages,
+        page_from,
+        page_to,
+    }
+}
+
+fn process_source(
+    source: &DocumentSource,
+    library: Option<&Path>,
+    options: &PdfOptions,
+    mut engine: Option<&mut Engine>,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Page) -> Result<()>,
+) -> Result<()> {
+    options.validate().map_err(invalid)?;
+    check_cancelled(cancel)?;
+    if source.is_pdf()? {
+        return process_pdf(source, library, options, &mut engine, cancel, sink);
+    }
+    if options.mode == OcrMode::Text {
+        return Err(invalid("text mode requires a PDF text layer"));
+    }
+    let image = match source {
+        #[cfg(test)]
+        DocumentSource::Memory(data) => decode_image(data)?,
+        DocumentSource::Path(path) => decode_image_file(path)?,
+    };
+    sink(required_engine(&mut engine)?.recognize_image_with_options(
+        &image,
+        0,
+        options.keep_furniture,
+    )?)
+}
+
+#[cfg(test)]
 fn decode_image(data: &[u8]) -> Result<GrayImage> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+    decode_reader(std::io::Cursor::new(data))
+}
+
+fn decode_image_file(path: &Path) -> Result<GrayImage> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    decode_reader(std::io::BufReader::new(file))
+}
+
+fn decode_reader(reader: impl Read + Seek) -> Result<GrayImage> {
+    let mut reader = image::ImageReader::new(std::io::BufReader::new(reader))
         .with_guessed_format()
         .map_err(invalid)?;
     let mut limits = image::Limits::default();
@@ -173,13 +476,7 @@ fn required_engine<'a>(engine: &'a mut Option<&mut Engine>) -> Result<&'a mut En
         .context("OCR model is required for this document")
 }
 
-fn process_pdf(
-    data: &[u8],
-    library: Option<&Path>,
-    options: &PdfOptions,
-    engine: &mut Option<&mut Engine>,
-    cancel: &AtomicBool,
-) -> Result<Vec<Page>> {
+fn bind_pdfium(library: Option<&Path>) -> Result<Pdfium> {
     let lock = PDFIUM_BIND_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("Pdfium binding lock poisoned"))?;
@@ -195,24 +492,70 @@ fn process_pdf(
         }
     };
     drop(lock);
-    // Never include the password or uploaded bytes in error context.
-    let document = pdfium
-        .load_pdf_from_byte_vec(data.to_vec(), options.password.as_deref())
-        .map_err(|error| invalid(format!("open uploaded PDF: {error}")))?;
+    Ok(pdfium)
+}
+
+fn open_document<'a>(
+    pdfium: &'a Pdfium,
+    source: &DocumentSource,
+    options: &PdfOptions,
+) -> Result<PdfDocument<'a>> {
+    // Never include the password or uploaded bytes in error context. Only
+    // encryption failures ask for `password`; a structurally valid envelope
+    // that Pdfium still cannot parse is corrupt input, not a locked document.
+    let result = match source {
+        #[cfg(test)]
+        DocumentSource::Memory(data) => {
+            pdfium.load_pdf_from_byte_vec(data.clone(), options.password.as_deref())
+        }
+        DocumentSource::Path(path) => pdfium.load_pdf_from_file(path, options.password.as_deref()),
+    };
+    result.map_err(|error| match error {
+        PdfiumError::PdfiumLibraryInternalError(
+            PdfiumInternalError::PasswordError | PdfiumInternalError::SecurityError,
+        ) if options.password.is_none() => PasswordRequired.into(),
+        error => invalid(format!("open uploaded PDF: {error}")),
+    })
+}
+
+fn process_pdf(
+    source: &DocumentSource,
+    library: Option<&Path>,
+    options: &PdfOptions,
+    engine: &mut Option<&mut Engine>,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(Page) -> Result<()>,
+) -> Result<()> {
+    let pdfium = bind_pdfium(library)?;
+    let document = open_document(&pdfium, source, options)?;
     let config = PdfRenderConfig::new()
         .scale_page_by_factor(options.dpi as f32 / 72.0)
         .set_maximum_width(MAX_DIMENSION)
         .set_maximum_height(MAX_DIMENSION);
-    document
-        .pages()
-        .iter()
-        .take(options.max_pages)
-        .enumerate()
-        .map(|(index, page)| {
-            check_cancelled(cancel)?;
-            process_page(&page, index, &config, options, engine, cancel)
-        })
-        .collect()
+    let page_count = document.pages().len() as usize;
+    // Select document page indices up front: a `pages` range must fit inside
+    // the real page count, and rendering plus recognition stay strictly
+    // sequential, so decoded pages never accumulate in memory.
+    let indices: Vec<usize> = match &options.pages {
+        Some(range) => {
+            range.validate_against(page_count)?;
+            (range.from..=range.to.unwrap_or(page_count))
+                .map(|page| page - 1)
+                .collect()
+        }
+        None => (0..page_count.min(options.max_pages)).collect(),
+    };
+    for index in indices {
+        check_cancelled(cancel)?;
+        let page = document
+            .pages()
+            .get(index.try_into().expect("page index fits PdfPageIndex"))
+            .context("selected PDF page is missing")?;
+        sink(process_page(
+            &page, index, &config, options, engine, cancel,
+        )?)?;
+    }
+    Ok(())
 }
 
 fn process_page(
@@ -635,10 +978,92 @@ mod tests {
     }
 
     #[test]
+    fn page_ranges_parse_and_name_their_bounds() {
+        let single = PageRange::parse("3").unwrap();
+        assert_eq!(single.from, 3);
+        assert_eq!(single.to, Some(3));
+        assert_eq!(PageRange::parse(" 1-10 ").unwrap().to, Some(10));
+        let open = PageRange::parse("1-").unwrap();
+        assert_eq!(open.to, None);
+        assert_eq!(open.to_string(), "1-");
+        assert_eq!(single.to_string(), "3");
+        assert_eq!(PageRange::parse("4-9").unwrap().to_string(), "4-9");
+        assert_eq!(single.selected_len(100), 1);
+        assert_eq!(open.selected_len(7), 7);
+        for garbage in ["a-b", "5-2", "0-3", "0", "", "1-2-3", "-4", "x"] {
+            let error = PageRange::parse(garbage).expect_err("invalid range");
+            assert!(error.to_string().contains(garbage.trim()), "{error}");
+        }
+        let error = PageRange::parse("5-2").unwrap_err();
+        assert!(error.to_string().contains("precedes"), "{error}");
+        let error = PageRange::parse("0-3").unwrap_err();
+        assert!(error.to_string().contains("start at 1"), "{error}");
+    }
+
+    #[test]
+    fn page_range_out_of_bounds_names_the_real_page_count() {
+        let range = PageRange::parse("8-10").unwrap();
+        let error = range.validate_against(7).expect_err("out of range");
+        assert_eq!(
+            error.to_string(),
+            "document has 7 pages; pages 8-10 is out of range"
+        );
+        range.validate_against(10).expect("in range");
+        PageRange::parse("7-")
+            .unwrap()
+            .validate_against(7)
+            .expect("open end fits");
+        let error = PageRange::parse("7-")
+            .unwrap()
+            .validate_against(6)
+            .expect_err("open start out");
+        assert_eq!(
+            error.to_string(),
+            "document has 6 pages; pages 7- is out of range"
+        );
+    }
+
+    #[test]
+    fn deadline_override_bounds_and_defaults() {
+        let mut options = PdfOptions::default();
+        for (value, valid) in [(29, false), (30, true), (900, true), (901, false)] {
+            options.deadline_secs = Some(value);
+            assert_eq!(options.validate().is_ok(), valid, "deadline_secs={value}");
+        }
+        options.deadline_secs = None;
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn image_metadata_needs_no_engine_or_pdfium() {
+        let data = fixture("scan.png");
+        let metadata =
+            inspect_document(&DocumentSource::Memory(data), None, &PdfOptions::default())
+                .expect("image metadata");
+        assert_eq!(metadata.pages, 1);
+        assert_eq!(
+            (metadata.page_sizes[0].width, metadata.page_sizes[0].height),
+            (1653, 2337)
+        );
+        let options = PdfOptions {
+            mode: OcrMode::Text,
+            ..PdfOptions::default()
+        };
+        let error = inspect_document(
+            &DocumentSource::Memory(b"not-a-pdf".to_vec()),
+            None,
+            &options,
+        )
+        .expect_err("text mode rejects images");
+        assert!(error.to_string().contains("requires a PDF"));
+    }
+
+    #[test]
     fn malformed_input_is_typed_and_cancellation_precedes_parsing() {
         let options = PdfOptions::default();
         for bytes in [&b"corrupt image"[..], &b"%PDF-1.7 truncated"[..]] {
-            let error = validate_input(bytes, &options).expect_err("invalid input");
+            let error = inspect_document(&DocumentSource::Memory(bytes.to_vec()), None, &options)
+                .expect_err("invalid input");
             assert!(matches!(
                 error.downcast_ref::<InputError>(),
                 Some(InputError::Invalid(_))
@@ -845,6 +1270,71 @@ mod tests {
                 "right bottom"
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; page ranges and metadata inspect a real PDF without weights"]
+    fn real_pdf_page_range_and_metadata_use_the_document_page_count() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let data = fixture("scan.pdf");
+        let options = PdfOptions {
+            pages: Some(PageRange::parse("2-").unwrap()),
+            ..PdfOptions::default()
+        };
+        let error = process(&data, Some(Path::new(&library)), &options, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("document has 1 pages; pages 2- is out of range"),
+            "{error}"
+        );
+        let metadata = inspect_document(
+            &DocumentSource::Memory(data),
+            Some(Path::new(&library)),
+            &PdfOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.pages, 1);
+        assert!(metadata.page_sizes[0].width > 0 && metadata.page_sizes[0].height > 0);
+        // dpi scales the reported rendered size.
+        let options = PdfOptions {
+            dpi: 72,
+            ..PdfOptions::default()
+        };
+        let low = inspect_document(
+            &DocumentSource::Memory(fixture("scan.pdf")),
+            Some(Path::new(&library)),
+            &options,
+        )
+        .unwrap();
+        assert!(low.page_sizes[0].width < metadata.page_sizes[0].width);
+    }
+
+    #[test]
+    #[ignore = "requires PDFIUM_LIBRARY; encrypted PDFs name the missing password in metadata mode"]
+    fn real_encrypted_pdf_metadata_requires_a_password() {
+        let library = std::env::var("PDFIUM_LIBRARY").expect("PDFIUM_LIBRARY");
+        let data = fixture("encrypted.pdf");
+        let error = inspect_document(
+            &DocumentSource::Memory(data),
+            Some(Path::new(&library)),
+            &PdfOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.is::<PasswordRequired>(), "{error}");
+        assert!(error.to_string().contains("password"), "{error}");
+        // The same call with the fixture password decodes without an engine.
+        let options = PdfOptions {
+            password: Some("fixture-password".into()),
+            ..PdfOptions::default()
+        };
+        let metadata = inspect_document(
+            &DocumentSource::Memory(fixture("encrypted.pdf")),
+            Some(Path::new(&library)),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(metadata.pages, 1);
     }
 
     #[test]
