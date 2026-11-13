@@ -425,8 +425,23 @@ async fn task(
             }
         }
     }
-    let options = requests::merge(kind, &model.config.request_defaults, fields)
-        .map_err(ApiError::bad_request)?;
+    // The alias serves v0.1 clients: v0.2-only defaults must not reach their
+    // merge at all, or a default `pages` would collide with a legacy
+    // `max_pages` and reject a valid v0.1 request.
+    let defaults = model
+        .config
+        .request_defaults
+        .iter()
+        .filter(|(key, _)| {
+            !legacy
+                || !matches!(
+                    key.as_str(),
+                    "pages" | "pages_only" | "stream" | "deadline_secs"
+                )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let options = requests::merge(kind, &defaults, fields).map_err(ApiError::bad_request)?;
     if let RequestOptions::Ocr(mut options) = options {
         if legacy {
             // The alias serves v0.1 clients: v0.2-only options never apply
@@ -1000,6 +1015,13 @@ mod tests {
         Arc::new(Registry::new(vec![config]).unwrap())
     }
 
+    /// A registry whose model defaults carry a v0.2 selector: the legacy
+    /// alias must ignore them, never collide with them.
+    fn registry_with_pages_default(model: &str) -> Arc<Registry> {
+        let config: ManagedModelConfig = serde_json::from_value(json!({"model":model,"provider":"onnx","lifecycle":{"load":"on_demand","prefetch":false},"request_defaults":{"pages":"1-10"}})).unwrap();
+        Arc::new(Registry::new(vec![config]).unwrap())
+    }
+
     async fn serve(state: ServerState) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1421,6 +1443,24 @@ mod tests {
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["kind"], "ocr");
         assert_eq!(body["pages"], 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_ignores_v2_selectors_in_model_defaults() {
+        // A default `pages` must not collide with a legacy `max_pages`: the
+        // alias filters v0.2-only defaults before merging, so a valid v0.1
+        // request passes validation and stops only at the unloaded model.
+        let state = ServerState::new(registry_with_pages_default(INDRA), None, DEFAULT_MAX_BYTES);
+        let (url, task) = serve(state).await;
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/documents/ocr"))
+            .header("Accept", "application/json")
+            .multipart(ocr_form(vec![("max_pages", "5")]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         task.abort();
     }
 
