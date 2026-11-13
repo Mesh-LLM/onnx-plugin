@@ -29,7 +29,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -595,7 +595,16 @@ async fn ocr_task(
         tokio::time::Instant::now() + Duration::from_secs(budget)
     };
     if format == Representation::NdJson || options.stream {
-        return ocr_stream(state, model, upload, options, budget, metadata.pages).await;
+        return ocr_stream(
+            state,
+            model,
+            upload,
+            options,
+            budget,
+            metadata.pages,
+            deadline,
+        )
+        .await;
     }
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancellation = cancel.0.clone();
@@ -713,6 +722,21 @@ fn error_event(message: &str) -> Value {
     json!({"type": "error", "error": {"message": message}})
 }
 
+fn send_stream_line(
+    runtime: &tokio::runtime::Handle,
+    tx: &mpsc::Sender<StreamItem>,
+    line: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    runtime
+        .block_on(tokio::time::timeout_at(
+            deadline,
+            tx.send(Ok(format!("{line}\n").into())),
+        ))
+        .map_err(|_| anyhow::anyhow!("stream deadline exceeded"))?
+        .map_err(|_| anyhow::anyhow!("stream receiver dropped"))
+}
+
 /// NDJSON streaming on the canonical route. Acquisition happens before the
 /// 200 is sent, so load failures stay normal HTTP errors; once the stream
 /// starts, a failure is delivered as an `error` event and the stream ends.
@@ -724,6 +748,7 @@ async fn ocr_stream(
     options: PdfOptions,
     budget: u64,
     page_count: usize,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, ApiError> {
     enum Worker {
         Text(tokio::sync::OwnedSemaphorePermit),
@@ -746,9 +771,9 @@ async fn ocr_stream(
         )
     } else {
         Worker::Engine(
-            model
-                .acquire()
+            tokio::time::timeout_at(deadline, model.acquire())
                 .await
+                .map_err(|_| deadline_exceeded(budget))?
                 .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error))?,
         )
     };
@@ -766,11 +791,10 @@ async fn ocr_stream(
         .map_err(ApiError::internal)?;
     let pdfium = state.pdfium_library.clone();
     let file = upload.file;
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let send = |line: &str| -> Result<()> {
-            // One JSON object per line: the framing NDJSON promises.
-            tx.blocking_send(Ok(format!("{line}\n").into()))
-                .map_err(|_| anyhow::anyhow!("stream receiver dropped"))?;
+            send_stream_line(&runtime, &tx, line, deadline)?;
             if cancel.load(Ordering::Relaxed) {
                 anyhow::bail!("request cancelled");
             }
@@ -778,14 +802,12 @@ async fn ocr_stream(
         };
         let stream_result = (|| -> Result<()> {
             send(&meta)?;
-            let started = Instant::now();
-            let budget = Duration::from_secs(budget);
             let mut sink = |page: Page| -> Result<()> {
-                if started.elapsed() > budget {
+                if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "model request deadline of {}s exceeded; \
                          split the document into chunks with `pages` (for example pages=1-10) and retry",
-                        budget.as_secs()
+                        budget
                     );
                 }
                 let line = serde_json::to_string(&page_event(&page))?;
@@ -831,7 +853,7 @@ async fn ocr_stream(
             // Best effort: the receiver may already be gone.
             stream_cancel.store(true, Ordering::Relaxed);
             if let Ok(line) = serde_json::to_string(&error_event(&error.to_string())) {
-                let _ = tx.blocking_send(Ok(format!("{line}\n").into()));
+                let _ = tx.try_send(Ok(format!("{line}\n").into()));
             }
         }
     });
@@ -1528,6 +1550,19 @@ mod tests {
         assert_eq!(done, json!({"type":"done","pages":3}));
         let error = error_event("boom");
         assert_eq!(error, json!({"type":"error","error":{"message":"boom"}}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stalled_stream_send_stops_at_deadline() {
+        let (tx, _rx) = mpsc::channel::<StreamItem>(1);
+        tx.send(Ok("full".into())).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let handle = tokio::runtime::Handle::current();
+        let result =
+            tokio::task::spawn_blocking(move || send_stream_line(&handle, &tx, "page", deadline))
+                .await
+                .unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
     }
 
     #[tokio::test]

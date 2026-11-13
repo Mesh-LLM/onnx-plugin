@@ -38,6 +38,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Prepare Windows DLL output directories
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force target/debug/build/examples, target/debug/build/deps | Out-Null
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
