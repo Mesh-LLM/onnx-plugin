@@ -9,7 +9,7 @@ Mesh selects models in `~/.mesh-llm/config.toml`, supplies their configuration t
 | Whisper Tiny | [Whisper](WHISPER.md) | `/v1/audio/transcriptions` |
 | Depth Anything V2 Small | [Depth](DEPTH.md) | `/mesh/v1/images/depth` |
 
-Each guide starts with the use cases that task is actually good for and the constraint that bounds it. The [end-to-end example](HTTP_EXAMPLES.md#worked-example-one-claim-submission-four-models) runs all four on a single submission, and [the request reference](HTTP_EXAMPLES.md) covers every endpoint's fields in one place.
+Each guide starts with the use cases that task is actually good for and the constraint that bounds it. The [end-to-end example](HTTP_EXAMPLES.md#worked-example-one-claim-submission-four-models) runs all four on a single submission, and [the request reference](HTTP_EXAMPLES.md) covers every endpoint's fields in one place. v0.2 adds the long-document controls to the canonical OCR route — `pages` ranges, `pages_only` metadata, NDJSON streaming and page-scaled `deadline_secs` — with the legacy `/v1/documents/ocr` alias unchanged; see [the Indra guide](INDRA.md) and the [migrating note](../README.md#migrating-from-v01-to-v02).
 
 These changes require the accompanying Mesh managed-model implementation. The ordinary plugin package installer does not download model weights. See [configuration and lifecycle](CONFIGURATION.md) and [validation](TESTING.md).
 

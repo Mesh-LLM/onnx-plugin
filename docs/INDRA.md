@@ -44,7 +44,7 @@ curl --fail-with-body -H 'Accept: application/json' \
 JSON contains `model`, and `pages` containing `page_index`, `text`, `markdown`, `source`, `rotation`, `vertical`, `lines` (text, pixel bounding box, confidence), and layout `blocks`. For example, the response shape is:
 
 ```json
-{"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","pages":[{"page_index":0,"text":"Example text","markdown":"Example text","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Example text","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
+{"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","page_from":1,"page_to":1,"pages":[{"page_index":0,"text":"Example text","markdown":"Example text","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Example text","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
 ```
 
 This is an illustrative schema example, not measured inference output. Text and Markdown representations join pages with a blank line:
@@ -57,6 +57,27 @@ curl --fail-with-body -H 'Accept: text/markdown' \
 ```
 
 For PDF input, install a platform-compatible Pdfium library and set `ONNX_PDFIUM_LIBRARY` in the serving process environment or pass plugin args `['--pdfium-library', '/absolute/path/to/libpdfium.dylib']` (use TOML double quotes in actual configuration). Linux uses `.so`, Windows `.dll`. PDF rendering is bounded to 4096 pixels per dimension and DPI 36–600. `max_pages` is 1–1000; zero is rejected. `password` is a request-only multipart field for encrypted PDFs.
+
+v0.2 adds the long-document controls on the canonical `/mesh/v1/documents/ocr` route (the legacy alias rejects them):
+
+- **`pages`** selects a 1-based inclusive range: `3` is one page, `1-10` a closed range, `1-` runs to the end of the document. Whitespace is tolerated. `pages` and `max_pages` are mutually exclusive — `pages` selects, `max_pages` caps — and a range past the document fails with `400`, naming the real page count. Responses carry `page_from`/`page_to` (1-based, inclusive) so chunked callers can reassemble; page events and page indices stay in document page order.
+- **`pages_only=true`** answers document metadata without the model engine: `{"model":…,"kind":"ocr","pages":N,"page_sizes":[{"width":W,"height":H},…]}`, sizes at the requested DPI for PDFs (one entry at native size for images). It works on a cold model and never enters model admission. An encrypted PDF without `password` fails with a `401`-style error naming the field.
+- **`stream=true`** (or `Accept: application/x-ndjson`) streams results as NDJSON: a `meta` event first, a `page` event per completed page in page order, then `done`. See [HTTP_EXAMPLES](HTTP_EXAMPLES.md#streaming-ocr-results-ndjson).
+- **`deadline_secs`** (30–900) replaces the flat 120-second budget with `min(60 + 2 * selected_pages, 600)` by default; a timeout is a `408`-style error suggesting `pages` for chunking.
+
+```sh
+# Pages 5-12 only, as NDJSON events as each page completes.
+curl --fail-with-body -N -H 'Accept: application/x-ndjson' \
+  -F 'model=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b' \
+  -F 'file=@paper.pdf' -F 'pages=5-12' \
+  http://localhost:9337/mesh/v1/documents/ocr
+
+# Metadata only: page count and rendered sizes, no model session.
+curl --fail-with-body -H 'Accept: application/json' \
+  -F 'model=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b' \
+  -F 'file=@paper.pdf' -F 'pages_only=true' \
+  http://localhost:9337/mesh/v1/documents/ocr
+```
 
 `mode=auto` uses a usable text layer and falls back to OCR. `mode=ocr` always recognizes pixels; `mode=text` uses PDF text without auto-quality checks and is rejected for raster images. `image_ocr=true` adds OCR for image regions in auto mode; text mode always extracts only the text layer. `keep_furniture` affects Markdown headers/footers while retaining JSON structure. Native auto-quality checks are heuristic and are not claimed to match upstream exactly.
 

@@ -43,6 +43,10 @@ pub struct Page {
 #[derive(Debug, Clone, Serialize)]
 pub struct Document {
     pub model: &'static str,
+    /// 1-based inclusive document bounds of `pages`, so chunked callers can
+    /// reassemble a response next to its neighbors.
+    pub page_from: usize,
+    pub page_to: usize,
     pub pages: Vec<Page>,
 }
 
@@ -155,8 +159,11 @@ impl Engine {
             .enumerate()
             .map(|(index, image)| self.recognize_image(&image?, index))
             .collect::<Result<Vec<_>>>()?;
+        let page_to = pages.len();
         Ok(Document {
             model: MODEL,
+            page_from: 1,
+            page_to,
             pages,
         })
     }

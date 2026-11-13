@@ -9,7 +9,9 @@ Every request is `multipart/form-data` and needs **two** fields on every task:
 - `model` — the exact string configured in `[[models]]`, including the
   `@revision`. It is required; a name that is not configured is a `400`, and
   selecting a model that does not serve the endpoint's task is a `400` too.
-- `file` — the input. Uploads are capped at 64 MiB.
+- `file` — the input. Uploads are capped at 100 MiB by default; set
+  `ONNX_MAX_BYTES` or the plugin's `--max-bytes` flag to change it, and read
+  the effective cap per model as `max_upload_bytes` from `GET /v1/models`.
 
 Anything else is task-specific and may be omitted when
 `[models.request_defaults]` supplies it. Let curl set the multipart
@@ -17,13 +19,18 @@ Anything else is task-specific and may be omitted when
 
 | Task | Endpoint | Protocol | Accept |
 |---|---|---|---|
-| Document OCR | `POST /mesh/v1/documents/ocr` | `document_ocr_v1` | `application/json`, `text/plain`, `text/markdown` |
+| Document OCR | `POST /mesh/v1/documents/ocr` | `document_ocr_v1` | `application/json`, `text/plain`, `text/markdown`, `application/x-ndjson` |
 | Transcription | `POST /v1/audio/transcriptions` | `transcription_v1` | `application/json`, `text/plain` |
 | Image/text similarity | `POST /mesh/v1/images/similarity` | `image_text_similarity_v1` | `application/json` |
 | Relative depth | `POST /mesh/v1/images/depth` | `depth_estimation_v1` | `application/json`, `image/png` |
 
 JSON is the default. A type the endpoint cannot produce is `406`, and every
-response carries `Vary: Accept`. `response_format` is not accepted on the
+response carries `Vary: Accept`. OCR's `application/x-ndjson` is canonical-route
+only and streams events as pages complete (see
+[Streaming OCR results](#streaming-ocr-results-ndjson)); the legacy
+`/v1/documents/ocr` alias keeps the v0.1 representations and never streams, and
+the v0.2 fields (`pages`, `pages_only`, `stream`, `deadline_secs`) are rejected
+there. `response_format` is not accepted on the
 `/mesh/v1/` task routes, whose options are body fields of their own. The
 OpenAI-shaped transcription route is the exception: it accepts
 `response_format=json|text`, because that is how an OpenAI client names the
@@ -95,8 +102,9 @@ prefetch = true
 
 The `model` value above is also the `model` field value in every request — there
 is no separate serving name. A configured model that is not resident still
-appears as `loadable`; the first request loads it, and Mesh's 120-second deadline
-covers acquisition, loading and inference, so a cold start on a slow link can
+appears as `loadable`; the first request loads it, and the OCR deadline
+(`deadline_secs`, default `min(60 + 2 * selected_pages, 600)`) covers
+acquisition, loading and inference, so a cold start on a slow link can
 time out while the host's download continues. A later request reuses the cache.
 
 To stay off the network entirely, add `[models.source] local_dir = "..."` with
@@ -119,19 +127,55 @@ curl --fail-with-body \
 | `mode` | `auto`, `ocr`, `text` | `auto` |
 | `image_ocr` | `true`/`false` — OCR images embedded in a text-layer PDF | `true` |
 | `keep_furniture` | `true`/`false` — keep headers and footers in Markdown | `false` |
-| `max_pages` | 1–1000 | 1000 |
+| `max_pages` | 1–1000 — cap the pages processed | 1000 |
+| `pages` | `3`, `1-10`, `1-` — select a 1-based inclusive range; mutually exclusive with `max_pages`; out-of-range is a `400` naming the real page count | — |
+| `pages_only` | `true`/`false` — metadata only: page count and rendered `page_sizes`, no model session, works on a cold model | `false` |
+| `stream` | `true`/`false` — stream NDJSON page events (canonical route only; `Accept: application/x-ndjson` also selects it) | `false` |
+| `deadline_secs` | 30–900 — per-request acquisition + inference budget | `min(60 + 2 * selected_pages, 600)` |
 | `password` | opens an encrypted PDF; request-only, never a default | — |
 
 Booleans and numbers are sent as JSON literals (`-F 'image_ocr=false'`,
-`-F 'dpi=300'`); `mode` and `password` are strings. PDF input needs Pdfium on the
-plugin host; images do not.
+`-F 'dpi=300'`); `mode`, `pages` and `password` are strings. PDF input needs
+Pdfium on the plugin host; images do not.
 
 ```json
-{"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","pages":[{"page_index":0,"text":"Invoice 4471","markdown":"Invoice 4471","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Invoice 4471","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
+{"model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","page_from":1,"page_to":1,"pages":[{"page_index":0,"text":"Invoice 4471","markdown":"Invoice 4471","source":"ocr","rotation":0,"vertical":false,"lines":[{"text":"Invoice 4471","bbox":[10,20,150,40],"confidence":0.95}],"blocks":[]}]}
 ```
 
-`text/plain` and `text/markdown` return the concatenated page text, separated by
-a blank line.
+`page_from`/`page_to` are 1-based inclusive document bounds, so a chunked
+caller can place each response next to its neighbors. `text/plain` and
+`text/markdown` return the concatenated page text, separated by a blank line.
+
+## Streaming OCR results (NDJSON)
+
+On the canonical route, `Accept: application/x-ndjson` (preferred) or the
+multipart field `stream=true` selects a streaming response:
+`Content-Type: application/x-ndjson`, one JSON object per line, emitted as
+each page completes:
+
+```sh
+curl --fail-with-body -N -H 'Accept: application/x-ndjson' \
+  -F 'model=datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b' \
+  -F 'file=@paper.pdf' -F 'pages=1-10' \
+  http://localhost:9337/mesh/v1/documents/ocr
+```
+
+```json
+{"type":"meta","model":"datalab-to/indra-ocr@bd02167fdf2005a19962cc15188f8496a2c87d3b","pages":10,"page_from":1,"page_to":10}
+{"type":"page","page":1,"text":"…","markdown":"…","lines":[…],"blocks":[…]}
+{"type":"page","page":2,"text":"…","markdown":"…","lines":[…],"blocks":[…]}
+{"type":"done","pages":10}
+```
+
+`meta` is always first, `page` events arrive in page order as pages finish
+(`page` is the 1-based document page number), and `done` is last. A failure
+after streaming started is delivered as
+`{"type":"error","error":{"message":"…"}}` and ends the stream; failures
+before the first page (negotiation, validation, model load) stay normal HTTP
+error statuses with the JSON error body, not a `200` stream. `pages_only=true`
+answers with plain metadata JSON instead of a stream. The legacy
+`/v1/documents/ocr` alias never streams: NDJSON is a `406` there and
+`stream=true` is rejected.
 
 ## Transcription
 
@@ -218,11 +262,12 @@ configured model, its variant and its residency (`loadable`, `ready`, `busy`).
 
 | Status | Cause |
 |---|---|
-| `400` | `model` missing or not configured, a model asked to serve the wrong task, an unknown or out-of-range field, or input the task rejects |
+| `400` | `model` missing or not configured, a model asked to serve the wrong task, an unknown or out-of-range field, bad `pages` syntax, a `pages`/`max_pages` combination, or input the task rejects |
+| `401` | An encrypted PDF opened without the `password` field (including `pages_only=true`) |
 | `406` | `Accept` names no representation this endpoint produces |
-| `400` | Upload is empty or over 64 MiB |
+| `413` | Upload is empty (400) or over the configured cap, default 100 MiB (`ONNX_MAX_BYTES`) |
 | `503` | Model could not be loaded, plugin unreachable, or Pdfium missing for PDF input |
-| `504` | The 120-second deadline expired before the model answered |
+| `408` | The per-request deadline expired before the model answered; the message names the budget and suggests `pages` for chunking |
 
 ## Worked example: one claim submission, four models
 
@@ -247,6 +292,12 @@ curl --fail-with-body -H 'Accept: application/json' \
   -F "model=$OCR_MODEL" -F 'mode=auto' -F 'max_pages=3' \
   -F 'file=@service-form.pdf' "$BASE/mesh/v1/documents/ocr"
 ```
+
+A longer form can be chunked instead of capped: `pages=1-10`, then
+`pages=11-20`, reassembling by the response's `page_from`/`page_to`, or read
+straight off an NDJSON stream with `-H 'Accept: application/x-ndjson'`, which
+delivers each page as it completes. `pages_only=true` on the first upload
+reports the page count and rendered sizes before committing to a pass.
 
 **2. Route the photo.** Classification is zero-shot against labels the backend
 supplies, so the taxonomy lives in the application rather than in the model:

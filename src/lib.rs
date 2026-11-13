@@ -27,9 +27,13 @@ struct Args {
     /// Pdfium dynamic library for PDF input. Image input needs no Pdfium.
     #[arg(long, env = "ONNX_PDFIUM_LIBRARY")]
     pdfium_library: Option<PathBuf>,
+    /// Maximum upload size in bytes; bodies over the cap fail with 413.
+    #[arg(long, env = "ONNX_MAX_BYTES", default_value_t = server::DEFAULT_MAX_BYTES)]
+    max_bytes: usize,
 }
 
 async fn run_async(args: Args) -> Result<()> {
+    anyhow::ensure!(args.max_bytes > 0, "ONNX_MAX_BYTES must be at least 1 byte");
     let registry = Arc::new(registry::Registry::new(
         mesh_llm_plugin::models::configured_models_from_env()?,
     )?);
@@ -42,10 +46,11 @@ async fn run_async(args: Args) -> Result<()> {
     tokio::spawn(async move {
         if let Err(error) = axum::serve(
             listener,
-            server::router(server::ServerState {
-                registry: server_registry,
-                pdfium_library: args.pdfium_library,
-            }),
+            server::router(server::ServerState::new(
+                server_registry,
+                args.pdfium_library,
+                args.max_bytes,
+            )),
         )
         .await
         {

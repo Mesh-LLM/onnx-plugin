@@ -81,16 +81,29 @@ pub fn merge(
     defaults: &BTreeMap<String, impl serde::Serialize>,
     fields: BTreeMap<String, String>,
 ) -> Result<RequestOptions> {
+    if kind == Kind::Indra && fields.contains_key("pages") && fields.contains_key("max_pages") {
+        bail!(
+            "`pages` selects a page range and `max_pages` caps the page count; \
+             they are mutually exclusive — use `pages` to select (for example 1-10) or `max_pages` to cap"
+        );
+    }
     let mut values: Map<String, Value> = serde_json::from_value(serde_json::to_value(defaults)?)?;
     for (key, value) in fields {
         let parsed = match key.as_str() {
             "dpi" | "max_pages" | "top_k" | "max_output_tokens" | "image_ocr"
-            | "keep_furniture" | "truncate_text" | "labels" => serde_json::from_str(&value)?,
+            | "keep_furniture" | "truncate_text" | "labels" | "pages_only" | "stream"
+            | "deadline_secs" => serde_json::from_str(&value)?,
             _ => Value::String(value),
         };
         values.insert(key, parsed);
     }
     decode(kind, Value::Object(values), true)
+}
+
+/// Per-request acquisition + inference budget when the caller does not name
+/// one: grows with the selected page count, capped at ten minutes.
+pub fn default_deadline_secs(pages: usize) -> u64 {
+    std::cmp::min(60 + 2 * pages as u64, 600)
 }
 
 fn decode(kind: Kind, value: Value, request: bool) -> Result<RequestOptions> {
@@ -195,5 +208,86 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn ocr_v2_fields_parse_validate_and_stay_task_local() {
+        // `pages` tolerates whitespace; `pages_only`, `stream` and
+        // `deadline_secs` arrive as JSON literals like the other booleans.
+        let RequestOptions::Ocr(options) = merge(
+            Kind::Indra,
+            &BTreeMap::<String, Value>::new(),
+            BTreeMap::from([
+                ("pages".into(), " 2-5 ".into()),
+                ("pages_only".into(), "true".into()),
+                ("stream".into(), "false".into()),
+                ("deadline_secs".into(), "120".into()),
+            ]),
+        )
+        .unwrap() else {
+            panic!("ocr")
+        };
+        let range = options.pages.expect("range");
+        assert_eq!((range.from, range.to), (2, Some(5)));
+        assert!(options.pages_only);
+        assert!(!options.stream);
+        assert_eq!(options.deadline_secs, Some(120));
+
+        // Syntax, bounds and exclusivity fail before any document or model work.
+        for (key, value) in [
+            ("pages", "a-b"),
+            ("pages", "5-2"),
+            ("pages", "0-3"),
+            ("deadline_secs", "29"),
+            ("deadline_secs", "901"),
+        ] {
+            let error = merge(
+                Kind::Indra,
+                &BTreeMap::<String, Value>::new(),
+                BTreeMap::from([(key.into(), value.into())]),
+            )
+            .err()
+            .expect("invalid field");
+            assert!(error.to_string().contains(value.trim()), "{error}");
+        }
+        let error = merge(
+            Kind::Indra,
+            &BTreeMap::<String, Value>::new(),
+            BTreeMap::from([
+                ("pages".into(), "1-10".into()),
+                ("max_pages".into(), "5".into()),
+            ]),
+        )
+        .err()
+        .expect("mutually exclusive");
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+
+        // The v0.2 OCR fields stay on the OCR schema: other tasks still reject them.
+        for kind in [Kind::Whisper, Kind::Clip, Kind::Depth] {
+            for (key, value) in [
+                ("pages", "1-10"),
+                ("pages_only", "true"),
+                ("stream", "true"),
+                ("deadline_secs", "120"),
+            ] {
+                assert!(
+                    merge(
+                        kind,
+                        &BTreeMap::<String, Value>::new(),
+                        BTreeMap::from([(key.into(), value.into())])
+                    )
+                    .is_err(),
+                    "{kind:?} must reject {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_default_scales_with_pages_and_caps() {
+        assert_eq!(default_deadline_secs(1), 62);
+        assert_eq!(default_deadline_secs(10), 80);
+        assert_eq!(default_deadline_secs(270), 600);
+        assert_eq!(default_deadline_secs(1000), 600);
     }
 }
