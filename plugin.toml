@@ -1,4 +1,4 @@
 name = "onnx"
-version = "0.2.0"
+version = "0.2.1"
 description = "Managed ONNX OCR, transcription, similarity and depth models for Mesh"
 command = "mesh-onnx"
